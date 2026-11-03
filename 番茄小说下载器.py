@@ -1327,6 +1327,8 @@ class Api:
 
     # ---------- 下载 ----------
     def download(self, book_id, ids=None, threads=8, out_dir=None):
+        if _dl_running.is_set():
+            return {"error": "已经有一个下载任务在跑，等它结束或先点「停止」"}
         info = _book_cache.get(book_id)
         if not info:
             try:
@@ -1360,7 +1362,8 @@ class Api:
                 info, chapters, out_dir, threads=max(1, int(threads or 8)),
                 on_log=lambda s: print(s), on_progress=on_progress,
                 should_stop=lambda: _stop_flag.is_set())
-            return {"ok": ok, "path": str(out), "failed": len(failed)}
+            return {"ok": ok, "path": str(out), "failed": len(failed),
+                    "stopped": _stop_flag.is_set()}
         except Exception as e:
             return {"error": str(e)}
         finally:
@@ -1476,6 +1479,9 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(_progress)
         elif path == "/api/ping":
             self._json({"ok": True})
+        elif path == "/favicon.ico":
+            self.send_response(204)
+            self.end_headers()
         else:
             self._json({"error": "not found"}, 404)
 

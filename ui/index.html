@@ -779,9 +779,9 @@ async function download(all) {
   $("#btnStop").disabled = true;
   syncIdleState();
   if (r.error) { toast(r.error); setStatus("下载失败"); return; }
-  setStatus(`完成 ${r.ok} 章`);
+  setStatus(r.stopped ? `已停止，保存了 ${r.ok} 章` : `完成 ${r.ok} 章`);
   toast(`已保存到 ${r.path}`);
-  $("#prog").style.width = "100%";
+  if (!r.stopped) $("#prog").style.width = "100%";
 }
 
 /** 一轮任务结束后，把进度条和轮询都收干净。 */
