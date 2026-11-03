@@ -555,8 +555,64 @@ def index_search(keyword, limit=80):
              "words": r[4] or 0, "status": r[5] or ""} for r in rows]
 
 
-def search_books(keyword, mode="book", limit=60, log=None, auto_index=True):
-    """搜索：优先本地索引（覆盖书库全量），没有索引就先建一次，最后才用搜索引擎兜底。"""
+SEARCH_API = "https://novel.snssdk.com/api/novel/channel/homepage/search/search/v1/"
+
+
+def official_search(keyword, limit=40, offset=0, log=None, meta=None):
+    """番茄官方轻量搜索接口：不需要签名，支持 offset 翻页，能搜全站。"""
+    keyword = (keyword or "").strip()
+    if not keyword:
+        return []
+    out, seen = [], set()
+    if meta is not None:
+        meta["has_more"] = False
+        meta["next_offset"] = offset
+    while len(out) < limit:
+        params = {"aid": "1967", "q": keyword, "offset": str(offset)}
+        url = SEARCH_API + "?" + urllib.parse.urlencode(params)
+        try:
+            payload = json.loads(Http.get(url, referer="https://fanqienovel.com/", timeout=20, retries=2))
+        except Exception as e:
+            if log:
+                log(f"[官方搜索] 请求失败：{e}")
+            break
+        if payload.get("code") != 0:
+            if log:
+                log(f"[官方搜索] 返回异常 code={payload.get('code')}")
+            break
+        data = payload.get("data") or {}
+        rows = data.get("ret_data") or []
+        for b in rows:
+            bid = str(b.get("book_id") or "")
+            if not bid or bid in seen:
+                continue
+            seen.add(bid)
+            out.append({
+                "book_id": bid,
+                "name": b.get("title") or b.get("book_name") or "",
+                "author": b.get("author") or "",
+                "abstract": (b.get("abstract") or "").replace("\n", " ").strip(),
+                "words": int(b.get("word_number") or 0),
+                "status": "完结" if str(b.get("creation_status")) == "0" else "连载中",
+                "category": b.get("category") or "",
+                "cover": b.get("thumb_url") or "",
+            })
+        next_off = int(data.get("offset") or (offset + 10))
+        more = bool(data.get("has_more"))
+        offset = next_off
+        if meta is not None:
+            meta["has_more"] = more
+            meta["next_offset"] = next_off
+        if not rows or not more:
+            break
+        time.sleep(0.15)
+    if log:
+        log(f"[官方搜索] 命中 {len(out)} 本")
+    return out[:limit]
+
+
+def search_books(keyword, mode="book", limit=60, log=None, auto_index=True, offset=0, meta=None):
+    """搜索：官方免签名接口（全站）优先，其次本地索引，最后搜索引擎兜底。"""
     kw = (keyword or "").strip()
     if not kw:
         return []
@@ -566,6 +622,16 @@ def search_books(keyword, mode="book", limit=60, log=None, auto_index=True):
         m = _ISBN_RE.search(kw)
         return [detail_cached(m.group(1))] if m else []
 
+    # 1) 官方搜索（全站、免签名）
+    try:
+        hits = official_search(kw, limit=limit, offset=offset, log=log, meta=meta)
+        if hits:
+            return hits
+    except Exception as e:
+        if log:
+            log(f"[官方搜索] 失败：{e}")
+
+    # 2) 本地索引
     hits = index_search(kw, limit)
     if hits:
         if log:
@@ -982,44 +1048,83 @@ GENDER_OPTS = [("全部", -1), ("男频", 0), ("女频", 1)]
 
 
 # -*- coding: utf-8 -*-
-"""CustomTkinter 界面：现代浅色/深色，三栏布局。"""
+"""界面（深色优先、封面卡片、徽章标签）。"""
 
-# (浅色, 深色)
-C_BG = ("#F2F3F5", "#13151A")
-C_CARD = ("#FFFFFF", "#1B1E24")
-C_CARD2 = ("#F7F8FA", "#22262E")
-C_LINE = ("#E6E9ED", "#2A2F38")
-C_TEXT = ("#1A1D21", "#E8EAED")
-C_MUTED = ("#7C848E", "#8A93A0")
+C_BG = ("#F6F7F9", "#0E1014")
+C_CARD = ("#FFFFFF", "#16191F")
+C_CARD2 = ("#F7F8FA", "#1D2128")
+C_CARD3 = ("#EFF1F4", "#232833")
+C_LINE = ("#E8EBEF", "#262B34")
+C_TEXT = ("#171A1F", "#E9EBEF")
+C_MUTED = ("#78818F", "#8A93A2")
+C_DIM = ("#9AA2AE", "#6C7583")
 C_PRIMARY = ("#FF5A1F", "#FF6B35")
 C_PRIMARY_H = ("#FF7A45", "#FF8352")
-C_SOFT = ("#FFF1EA", "#3A2418")
-C_SOFT_H = ("#FFE4D8", "#4A2C1C")
-C_SEL = ("#FFF3EC", "#2A2118")
+C_SOFT = ("#FFF0E8", "#2A1E18")
+C_SOFT_H = ("#FFE2D4", "#3A2820")
+C_SEL = ("#FFF4EE", "#221A15")
+C_GREEN = ("#12A150", "#2ECC71")
+C_BLUE = ("#2A6FDB", "#5B9CFF")
 
 UI_FONT = "Microsoft YaHei UI"
+COVER_DIR = CACHE_DIR / "covers"
 
 
 def ftc(size=11, bold=False):
     return ctk.CTkFont(family=UI_FONT, size=size, weight="bold" if bold else "normal")
 
 
-class BookCards(ctk.CTkScrollableFrame):
-    """书籍卡片列表"""
+# ---------------------------------------------------------------- 封面
+def _rounded(im, radius=10):
+    from PIL import Image, ImageDraw
+    mask = Image.new("L", im.size, 0)
+    ImageDraw.Draw(mask).rounded_rectangle([0, 0, im.size[0] - 1, im.size[1] - 1], radius, fill=255)
+    out = Image.new("RGBA", im.size, (0, 0, 0, 0))
+    out.paste(im, (0, 0), mask)
+    return out
 
-    def __init__(self, master, on_select=None):
+
+def load_cover(url, size=(52, 70)):
+    """下载并缓存封面，返回 RGBA 圆角图；失败返回 None。"""
+    if not url:
+        return None
+    # 官方搜索返回的 p*-tt.bytecdn.cn 带防盗链（403），换到可直连的域名
+    url = re.sub(r"https?://p\d+-tt\.bytecdn\.cn", "https://p3-novel.byteimg.com", url)
+    try:
+        from PIL import Image
+        import io
+        COVER_DIR.mkdir(parents=True, exist_ok=True)
+        key = hashlib.md5(url.encode("utf-8")).hexdigest()
+        path = COVER_DIR / f"{key}.png"
+        if not path.exists():
+            raw = Http.get(url, binary=True, timeout=15, retries=1)
+            im = Image.open(io.BytesIO(raw)).convert("RGB")
+            im = im.resize(size, Image.LANCZOS)
+            _rounded(im, 8).save(path)
+        return Image.open(path).convert("RGBA")
+    except Exception:
+        return None
+
+
+class BookCards(ctk.CTkScrollableFrame):
+    """书籍卡片列表（带封面、徽章）。"""
+
+    def __init__(self, master, on_select=None, on_cover=None):
         super().__init__(master, fg_color="transparent", corner_radius=0)
         self.on_select = on_select
+        self.on_cover = on_cover
         self.items = []
         self.selected = None
         self._cards = []
-        self.empty = ctk.CTkLabel(self, text="这里还没有内容", font=ftc(11), text_color=C_MUTED)
-        self.empty.pack(pady=40)
+        self._covers = {}
+        self.empty = ctk.CTkLabel(self, text="输入书名或作者开始搜索", font=ftc(11),
+                                  text_color=C_MUTED)
+        self.empty.pack(pady=60)
 
-    def _bind_recursive(self, widget, idx):
+    def _wire(self, widget, idx):
         widget.bind("<Button-1>", lambda e, i=idx: self._click(i))
-        for child in widget.winfo_children():
-            self._bind_recursive(child, idx)
+        for ch in widget.winfo_children():
+            self._wire(ch, idx)
 
     def _click(self, idx):
         self.selected = idx
@@ -1029,60 +1134,101 @@ class BookCards(ctk.CTkScrollableFrame):
 
     def _paint(self):
         for i, card in enumerate(self._cards):
-            card.configure(fg_color=C_SEL if i == self.selected else C_CARD2,
-                           border_color=C_PRIMARY if i == self.selected else C_LINE)
+            sel = i == self.selected
+            card.configure(fg_color=C_SEL if sel else C_CARD,
+                           border_color=C_PRIMARY if sel else C_LINE)
 
     def set_items(self, items, empty_text="没有找到书"):
         for c in self._cards:
             c.destroy()
         self._cards = []
+        self._covers = {}
         self.items = items or []
         self.selected = None
         self.empty.configure(text=empty_text)
-        self.empty.pack(pady=40)
+        self.empty.pack(pady=60)
         if not self.items:
             return
         self.empty.pack_forget()
         for i, b in enumerate(self.items):
-            card = ctk.CTkFrame(self, fg_color=C_CARD2, corner_radius=10,
-                                border_width=1, border_color=C_LINE)
-            card.pack(fill="x", pady=(0, 6), padx=2)
-            inner = ctk.CTkFrame(card, fg_color="transparent")
-            inner.pack(fill="x", padx=10, pady=7)
-
-            name = (b.get("name") or "未知书名")
-            avatar = ctk.CTkFrame(inner, width=34, height=34, corner_radius=17, fg_color=C_SOFT)
-            avatar.pack(side="left", padx=(0, 10))
-            avatar.pack_propagate(False)
-            ctk.CTkLabel(avatar, text=name[:1], font=ftc(14, True),
-                         text_color=C_PRIMARY).place(relx=0.5, rely=0.5, anchor="center")
-
-            body = ctk.CTkFrame(inner, fg_color="transparent")
-            body.pack(side="left", fill="x", expand=True)
-            ctk.CTkLabel(body, text=name, font=ftc(12, True), text_color=C_TEXT,
-                         anchor="w").pack(fill="x")
-            meta = "  ·  ".join(x for x in [
-                b.get("author") or "未知作者",
-                (f"{b['words'] / 10000:.1f} 万字" if b.get("words") else ""),
-                b.get("status") or "",
-            ] if x)
-            ctk.CTkLabel(body, text=meta, font=ftc(9), text_color=C_MUTED, anchor="w").pack(fill="x")
-            abstract = (b.get("abstract") or "").replace("\n", " ").strip()
-            if abstract:
-                ctk.CTkLabel(body, text=abstract[:52] + ("…" if len(abstract) > 52 else ""),
-                             font=ftc(9), text_color=C_MUTED, anchor="w").pack(fill="x", pady=(2, 0))
-
-            self._bind_recursive(card, i)
-            self._cards.append(card)
+            self._cards.append(self._make_card(i, b))
         self._paint()
+
+    def _make_card(self, i, b):
+        card = ctk.CTkFrame(self, fg_color=C_CARD, corner_radius=12,
+                            border_width=1, border_color=C_LINE)
+        card.pack(fill="x", pady=(0, 7), padx=2)
+        row = ctk.CTkFrame(card, fg_color="transparent")
+        row.pack(fill="x", padx=10, pady=9)
+
+        # 封面（先放占位）
+        cover = ctk.CTkFrame(row, width=52, height=70, corner_radius=8, fg_color=C_CARD3)
+        cover.pack(side="left", padx=(0, 11))
+        cover.pack_propagate(False)
+        ctk.CTkLabel(cover, text=(b.get("name") or "?")[:1], font=ftc(17, True),
+                     text_color=C_DIM).place(relx=0.5, rely=0.5, anchor="center")
+
+        body = ctk.CTkFrame(row, fg_color="transparent")
+        body.pack(side="left", fill="both", expand=True)
+
+        top = ctk.CTkFrame(body, fg_color="transparent")
+        top.pack(fill="x")
+        ctk.CTkLabel(top, text=(b.get("name") or "未知书名")[:26], font=ftc(12, True),
+                     text_color=C_TEXT, anchor="w").pack(side="left")
+        status = b.get("status") or ""
+        if status:
+            badge = ctk.CTkLabel(top, text=status, font=ftc(8),
+                                 text_color=C_GREEN if status == "完结" else C_BLUE,
+                                 fg_color=C_CARD3, corner_radius=6, width=34, height=18)
+            badge.pack(side="left", padx=(8, 0))
+
+        meta = "  ·  ".join(x for x in [
+            (b.get("author") or "未知作者")[:14],
+            (f"{b['words'] / 10000:.1f} 万字" if b.get("words") else ""),
+        ] if x)
+        ctk.CTkLabel(body, text=meta, font=ftc(9), text_color=C_MUTED, anchor="w").pack(fill="x")
+
+        abstract = (b.get("abstract") or "").replace("\n", " ").strip()
+        if abstract:
+            ctk.CTkLabel(body, text=abstract[:60] + ("…" if len(abstract) > 60 else ""),
+                         font=ftc(9), text_color=C_DIM, anchor="w").pack(fill="x")
+
+        cat = b.get("category") or ""
+        if cat:
+            chip = ctk.CTkLabel(body, text="  " + cat + "  ", font=ftc(8),
+                                text_color=C_PRIMARY, fg_color=C_SOFT, corner_radius=6, height=18)
+            chip.pack(anchor="w", pady=(3, 0))
+
+        self._wire(card, i)
+        if self.on_cover:
+            self.on_cover(i, b.get("cover") or "", cover)
+        return card
+
+    def set_cover(self, i, image):
+        """主线程回调：替换占位为封面图。"""
+        if i >= len(self._cards):
+            return
+        try:
+            card = self._cards[i]
+            row = card.winfo_children()[0]
+            holder = row.winfo_children()[0]
+            for ch in holder.winfo_children():
+                ch.destroy()
+            cimg = ctk.CTkImage(light_image=image, dark_image=image, size=(52, 70))
+            lbl = ctk.CTkLabel(holder, text="", image=cimg)
+            lbl.pack(fill="both", expand=True)
+            self._covers[i] = cimg
+            self._wire(card, i)
+        except Exception:
+            pass
 
 
 class App:
     def __init__(self, root):
         self.root = root
         self.root.title("番茄小说下载器")
-        self.root.geometry("1420x900")
-        self.root.minsize(1180, 760)
+        self.root.geometry("1440x900")
+        self.root.minsize(1200, 780)
 
         self.books = []
         self.book = None
@@ -1096,12 +1242,17 @@ class App:
         self.cats = {}
         self.main_opts = [("全部", -1)]
         self.tag_opts = [("全部", -1)]
+        self._auto_skip = 0
+        self.search_kw = ""
+        self.search_offset = 0
+        self.search_has_more = False
 
+        ctk.set_appearance_mode("light")
         self._build()
-        self.root.after(80, self._pump)
+        self.root.after(70, self._pump)
         self.bg(self._boot)
 
-    # ---------------- 构建 ----------------
+    # ---------------- 结构 ----------------
     def _build(self):
         self.root.grid_columnconfigure(0, weight=1)
         self.root.grid_rowconfigure(1, weight=1)
@@ -1110,43 +1261,45 @@ class App:
         self._build_bottom()
 
     def _build_top(self):
-        bar = ctk.CTkFrame(self.root, fg_color=C_CARD, corner_radius=14)
-        bar.grid(row=0, column=0, sticky="ew", padx=16, pady=(14, 0))
+        bar = ctk.CTkFrame(self.root, fg_color=C_CARD, corner_radius=16, height=76)
+        bar.grid(row=0, column=0, sticky="ew", padx=18, pady=(16, 0))
+        bar.grid_propagate(False)
         bar.grid_columnconfigure(3, weight=1)
 
         left = ctk.CTkFrame(bar, fg_color="transparent")
-        left.grid(row=0, column=0, sticky="w", padx=(16, 12), pady=12)
-        ctk.CTkLabel(left, text="番茄小说下载器", font=ftc(17, True),
+        left.grid(row=0, column=0, padx=(20, 18), pady=14, sticky="w")
+        ctk.CTkLabel(left, text="番茄小说下载器", font=ftc(18, True),
                      text_color=C_TEXT).pack(anchor="w")
-        ctk.CTkLabel(left, text="免费章节 · 搜索 · 预览 · 存 txt", font=ftc(9),
+        ctk.CTkLabel(left, text="免费章节 · 搜索 · 预览 · 导出 TXT", font=ftc(9),
                      text_color=C_MUTED).pack(anchor="w")
 
         self.seg_mode = ctk.CTkSegmentedButton(
             bar, values=["书名/作者", "正文关键词"], command=self._switch_mode,
-            font=ftc(10), height=32, corner_radius=8,
+            font=ftc(10), height=34, corner_radius=9,
             selected_color=C_PRIMARY, selected_hover_color=C_PRIMARY_H,
             fg_color=C_CARD2, text_color=C_TEXT, unselected_color=C_CARD2)
         self.seg_mode.set("书名/作者")
-        self.seg_mode.grid(row=0, column=1, padx=(0, 10), pady=12)
+        self.seg_mode.grid(row=0, column=1, padx=(0, 12))
 
-        self.entry_kw = ctk.CTkEntry(bar, placeholder_text="输入书名 / 作者 / 关键词，回车搜索",
-                                     height=38, corner_radius=19, font=ftc(11),
-                                     fg_color=C_CARD2, border_color=C_LINE, text_color=C_TEXT)
-        self.entry_kw.grid(row=0, column=3, sticky="ew", padx=(0, 10), pady=12)
+        self.entry_kw = ctk.CTkEntry(bar, placeholder_text="搜索书名、作者，或粘贴书籍链接 / 书号",
+                                     height=40, corner_radius=20, font=ftc(11),
+                                     fg_color=C_CARD2, border_color=C_LINE, border_width=1,
+                                     text_color=C_TEXT)
+        self.entry_kw.grid(row=0, column=3, sticky="ew", padx=(0, 12))
         self.entry_kw.bind("<Return>", lambda e: self.do_search())
 
-        self.btn_search = ctk.CTkButton(bar, text="搜索", width=86, height=38, corner_radius=19,
+        self.btn_search = ctk.CTkButton(bar, text="搜 索", width=96, height=40, corner_radius=20,
                                         font=ftc(11, True), fg_color=C_PRIMARY,
                                         hover_color=C_PRIMARY_H, command=self.do_search)
-        self.btn_search.grid(row=0, column=4, padx=(0, 10), pady=12)
+        self.btn_search.grid(row=0, column=4, padx=(0, 14))
 
-        self.sw_dark = ctk.CTkSwitch(bar, text="深色", font=ftc(9), command=self._toggle_theme,
-                                     progress_color=C_PRIMARY, text_color=C_MUTED)
-        self.sw_dark.grid(row=0, column=5, padx=(0, 16), pady=12)
+        self.sw_dark = ctk.CTkSwitch(bar, text="", width=44, command=self._toggle_theme,
+                                     progress_color=C_PRIMARY, fg_color=C_CARD3)
+        self.sw_dark.grid(row=0, column=5, padx=(0, 18))
 
     def _build_body(self):
         body = ctk.CTkFrame(self.root, fg_color="transparent")
-        body.grid(row=1, column=0, sticky="nsew", padx=16, pady=12)
+        body.grid(row=1, column=0, sticky="nsew", padx=18, pady=14)
         body.grid_columnconfigure(1, weight=1)
         body.grid_rowconfigure(0, weight=1)
         self._build_left(body)
@@ -1154,130 +1307,142 @@ class App:
         self._build_right(body)
 
     def _build_left(self, master):
-        panel = ctk.CTkFrame(master, fg_color=C_CARD, corner_radius=14, width=268)
-        panel.grid(row=0, column=0, sticky="nsw", padx=(0, 12))
+        panel = ctk.CTkFrame(master, fg_color=C_CARD, corner_radius=16, width=252)
+        panel.grid(row=0, column=0, sticky="nsw", padx=(0, 14))
         panel.grid_propagate(False)
         panel.grid_rowconfigure(0, weight=1)
         panel.grid_columnconfigure(0, weight=1)
 
         box = ctk.CTkScrollableFrame(panel, fg_color="transparent", corner_radius=0)
-        box.grid(row=0, column=0, sticky="nsew", padx=2, pady=(4, 0))
+        box.grid(row=0, column=0, sticky="nsew", padx=2, pady=(2, 0))
 
         ctk.CTkLabel(box, text="按标签找书", font=ftc(12, True), text_color=C_TEXT,
-                     anchor="w").pack(fill="x", padx=12, pady=(10, 0))
-        ctk.CTkLabel(box, text="从番茄书库筛选", font=ftc(9), text_color=C_MUTED,
-                     anchor="w").pack(fill="x", padx=12)
+                     anchor="w").pack(fill="x", padx=16, pady=(12, 0))
+        ctk.CTkLabel(box, text="番茄书库实时筛选", font=ftc(9), text_color=C_MUTED,
+                     anchor="w").pack(fill="x", padx=16, pady=(0, 4))
 
         def section(t):
-            ctk.CTkLabel(box, text=t, font=ftc(9), text_color=C_MUTED,
-                         anchor="w").pack(fill="x", padx=12, pady=(7, 2))
+            ctk.CTkLabel(box, text=t, font=ftc(9), text_color=C_DIM,
+                         anchor="w").pack(fill="x", padx=16, pady=(9, 3))
 
         def dropdown(values, default="全部"):
-            m = ctk.CTkOptionMenu(box, values=values, font=ftc(10), height=28, corner_radius=8,
+            m = ctk.CTkOptionMenu(box, values=values, font=ftc(10), height=30, corner_radius=8,
                                   fg_color=C_CARD2, button_color=C_CARD2,
                                   button_hover_color=C_SOFT, text_color=C_TEXT,
                                   dropdown_fg_color=C_CARD, dropdown_text_color=C_TEXT,
                                   dropdown_hover_color=C_SOFT)
             m.set(default)
-            m.pack(fill="x", padx=12)
+            m.pack(fill="x", padx=16)
             return m
 
         section("频道")
         self.opt_gender = dropdown(["全部", "男频", "女频"])
-
         section("分类")
         self.opt_cat = dropdown(["全部"])
-
-        section("标签（情节/角色/主题）")
+        section("标签")
         self.opt_tag = dropdown(["全部"])
-
         section("状态")
         self.opt_status = dropdown(["全部", "完结", "连载"])
-
         section("字数")
         self.opt_words = dropdown([n for n, _ in WORD_TIERS])
-
         section("排序")
         self.opt_sort = dropdown([n for n, _ in SORT_OPTS])
 
         self.btn_lib = ctk.CTkButton(box, text="查询书库", height=34, corner_radius=9,
                                      font=ftc(10, True), fg_color=C_SOFT, hover_color=C_SOFT_H,
                                      text_color=C_PRIMARY, command=self.do_library)
-        self.btn_lib.pack(fill="x", padx=12, pady=(12, 6))
+        self.btn_lib.pack(fill="x", padx=16, pady=(14, 14))
 
         idx = ctk.CTkFrame(panel, fg_color="transparent")
-        idx.grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 12))
+        idx.grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 14))
         ctk.CTkFrame(idx, height=1, fg_color=C_LINE).pack(fill="x", pady=(0, 10))
         ctk.CTkLabel(idx, text="本地索引", font=ftc(11, True), text_color=C_TEXT,
                      anchor="w").pack(fill="x")
-        ctk.CTkLabel(idx, text="把书库书单存本地，搜索秒出", font=ftc(9), text_color=C_MUTED,
-                     anchor="w").pack(fill="x", pady=(0, 6))
-        self.lbl_index = ctk.CTkLabel(idx, text="索引：0 本", font=ftc(10, True),
+        ctk.CTkLabel(idx, text="离线书库快照", font=ftc(9), text_color=C_MUTED,
+                     anchor="w").pack(fill="x", pady=(0, 5))
+        self.lbl_index = ctk.CTkLabel(idx, text="0 本", font=ftc(10, True),
                                       text_color=C_TEXT, anchor="w")
         self.lbl_index.pack(fill="x")
-        self.pb_index = ctk.CTkProgressBar(idx, height=6, corner_radius=3, progress_color=C_PRIMARY,
-                                           fg_color=C_CARD2)
+        self.pb_index = ctk.CTkProgressBar(idx, height=5, corner_radius=3,
+                                           progress_color=C_PRIMARY, fg_color=C_CARD3)
         self.pb_index.set(0)
         self.pb_index.pack(fill="x", pady=6)
-        self.btn_index = ctk.CTkButton(idx, text="建立索引", height=32, corner_radius=8,
-                                       font=ftc(10), fg_color=C_SOFT, hover_color=C_SOFT_H,
-                                       text_color=C_PRIMARY, command=self.do_index)
+        self.btn_index = ctk.CTkButton(idx, text="更新索引", height=30, corner_radius=8,
+                                       font=ftc(9), fg_color=C_CARD2, hover_color=C_SOFT,
+                                       text_color=C_TEXT, command=self.do_index)
         self.btn_index.pack(fill="x")
-        self.btn_index_deep = ctk.CTkButton(idx, text="深度索引（按分类）", height=28,
-                                            corner_radius=8, font=ftc(9), fg_color=C_CARD2,
-                                            hover_color=C_SOFT, text_color=C_MUTED,
-                                            command=self.do_index_deep)
-        self.btn_index_deep.pack(fill="x", pady=(6, 0))
 
     def _build_center(self, master):
-        panel = ctk.CTkFrame(master, fg_color=C_CARD, corner_radius=14)
+        panel = ctk.CTkFrame(master, fg_color=C_CARD, corner_radius=16)
         panel.grid(row=0, column=1, sticky="nsew")
         panel.grid_rowconfigure(1, weight=1)
         panel.grid_columnconfigure(0, weight=1)
 
         head = ctk.CTkFrame(panel, fg_color="transparent")
-        head.grid(row=0, column=0, sticky="ew", padx=16, pady=(12, 4))
+        head.grid(row=0, column=0, sticky="ew", padx=18, pady=(14, 6))
         self.lbl_list_title = ctk.CTkLabel(head, text="搜索结果", font=ftc(13, True),
                                            text_color=C_TEXT)
         self.lbl_list_title.pack(side="left")
-        self.lbl_hint = ctk.CTkLabel(head, text="", font=ftc(9), text_color=C_MUTED)
-        self.lbl_hint.pack(side="left", padx=8)
+        self.lbl_hint = ctk.CTkLabel(head, text="", font=ftc(9), text_color=C_DIM)
+        self.lbl_hint.pack(side="left", padx=10)
 
-        self.cards = BookCards(panel, on_select=self.pick_book)
-        self.cards.grid(row=1, column=0, sticky="nsew", padx=12)
+        self.cards = BookCards(panel, on_select=self.pick_book, on_cover=self._hook_cover)
+        self.cards.grid(row=1, column=0, sticky="nsew", padx=14)
 
         pager = ctk.CTkFrame(panel, fg_color="transparent")
-        pager.grid(row=2, column=0, sticky="ew", padx=16, pady=(4, 12))
-        self.btn_prev = ctk.CTkButton(pager, text="上一页", width=76, height=30, corner_radius=8,
+        pager.grid(row=2, column=0, sticky="ew", padx=18, pady=(6, 14))
+        self.btn_prev = ctk.CTkButton(pager, text="上一页", width=74, height=28, corner_radius=8,
                                       font=ftc(9), fg_color=C_CARD2, hover_color=C_SOFT,
-                                      text_color=C_TEXT, command=lambda: self.turn_page(-1))
+                                      text_color=C_MUTED, command=lambda: self.turn_page(-1))
         self.btn_prev.pack(side="left")
-        self.lbl_page = ctk.CTkLabel(pager, text="第 1 页", font=ftc(9), text_color=C_MUTED)
+        self.lbl_page = ctk.CTkLabel(pager, text="第 1 页", font=ftc(9), text_color=C_DIM)
         self.lbl_page.pack(side="left", padx=10)
-        self.btn_next = ctk.CTkButton(pager, text="下一页", width=76, height=30, corner_radius=8,
+        self.btn_next = ctk.CTkButton(pager, text="下一页", width=74, height=28, corner_radius=8,
                                       font=ftc(9), fg_color=C_CARD2, hover_color=C_SOFT,
-                                      text_color=C_TEXT, command=lambda: self.turn_page(1))
+                                      text_color=C_MUTED, command=lambda: self.turn_page(1))
         self.btn_next.pack(side="left")
+        self.btn_more = ctk.CTkButton(pager, text="加载更多", width=88, height=28, corner_radius=8,
+                                      font=ftc(9), fg_color=C_SOFT, hover_color=C_SOFT_H,
+                                      text_color=C_PRIMARY, command=self.load_more)
+        self.btn_more.pack(side="left", padx=(14, 0))
+        self.btn_more.configure(state="disabled")
 
     def _build_right(self, master):
-        panel = ctk.CTkFrame(master, fg_color=C_CARD, corner_radius=14, width=452)
-        panel.grid(row=0, column=2, sticky="nsew", padx=(12, 0))
+        panel = ctk.CTkFrame(master, fg_color=C_CARD, corner_radius=16, width=440)
+        panel.grid(row=0, column=2, sticky="nsew", padx=(14, 0))
         panel.grid_propagate(False)
 
-        self.lbl_book = ctk.CTkLabel(panel, text="未选择书籍", font=ftc(14, True),
-                                     text_color=C_TEXT, anchor="w")
-        self.lbl_book.pack(fill="x", padx=16, pady=(14, 2))
-        self.lbl_book_meta = ctk.CTkLabel(panel, text="", font=ftc(9), text_color=C_MUTED,
-                                          anchor="w", justify="left", wraplength=410)
-        self.lbl_book_meta.pack(fill="x", padx=16)
+        info = ctk.CTkFrame(panel, fg_color="transparent")
+        info.pack(fill="x", padx=18, pady=(16, 0))
 
-        ctk.CTkLabel(panel, text="章节目录（双击预览）", font=ftc(9), text_color=C_MUTED,
-                     anchor="w").pack(fill="x", padx=16, pady=(10, 4))
+        self.cover_big = ctk.CTkFrame(info, width=78, height=104, corner_radius=10, fg_color=C_CARD3)
+        self.cover_big.pack(side="left", padx=(0, 14))
+        self.cover_big.pack_propagate(False)
+        self.lbl_cover_ph = ctk.CTkLabel(self.cover_big, text="", font=ftc(20, True),
+                                         text_color=C_DIM)
+        self.lbl_cover_ph.place(relx=0.5, rely=0.5, anchor="center")
 
-        tree_wrap = tk.Frame(panel, bg="#FFFFFF", highlightthickness=0)
-        tree_wrap.pack(fill="both", expand=True, padx=14)
-        self.tree = ttk.Treeview(tree_wrap, columns=("t",), show="tree")
-        self.tree.column("#0", width=390, minwidth=200, stretch=True)
+        meta = ctk.CTkFrame(info, fg_color="transparent")
+        meta.pack(side="left", fill="both", expand=True)
+        self.lbl_book = ctk.CTkLabel(meta, text="未选择书籍", font=ftc(14, True),
+                                     text_color=C_TEXT, anchor="w", wraplength=300, justify="left")
+        self.lbl_book.pack(fill="x")
+        self.lbl_book_meta = ctk.CTkLabel(meta, text="从左侧列表选一本书", font=ftc(9),
+                                          text_color=C_MUTED, anchor="w", justify="left",
+                                          wraplength=300)
+        self.lbl_book_meta.pack(fill="x", pady=(2, 0))
+
+        self.lbl_abstract = ctk.CTkLabel(panel, text="", font=ftc(9), text_color=C_DIM,
+                                         anchor="w", justify="left", wraplength=390)
+        self.lbl_abstract.pack(fill="x", padx=18, pady=(8, 0))
+
+        ctk.CTkLabel(panel, text="章节目录", font=ftc(9, True), text_color=C_TEXT,
+                     anchor="w").pack(fill="x", padx=18, pady=(12, 4))
+
+        tree_wrap = tk.Frame(panel, bg="#16191F", highlightthickness=0)
+        tree_wrap.pack(fill="both", expand=True, padx=16)
+        self.tree = ttk.Treeview(tree_wrap, columns=("t",), show="tree", style="Fanqie.Treeview")
+        self.tree.column("#0", width=380, minwidth=200, stretch=True)
         sb = ttk.Scrollbar(tree_wrap, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=sb.set)
         self.tree.pack(side="left", fill="both", expand=True)
@@ -1285,86 +1450,95 @@ class App:
         self.tree.bind("<Double-1>", lambda e: self.preview_selected())
         self._style_tree()
 
-        prev_head = ctk.CTkFrame(panel, fg_color="transparent")
-        prev_head.pack(fill="x", padx=16, pady=(10, 4))
-        ctk.CTkLabel(prev_head, text="正文预览", font=ftc(9), text_color=C_MUTED).pack(side="left")
-        self.lbl_ptitle = ctk.CTkLabel(prev_head, text="", font=ftc(9), text_color=C_PRIMARY)
+        head2 = ctk.CTkFrame(panel, fg_color="transparent")
+        head2.pack(fill="x", padx=18, pady=(10, 4))
+        ctk.CTkLabel(head2, text="正文预览", font=ftc(9, True), text_color=C_TEXT).pack(side="left")
+        self.lbl_ptitle = ctk.CTkLabel(head2, text="", font=ftc(9), text_color=C_PRIMARY)
         self.lbl_ptitle.pack(side="left", padx=8)
 
         text_wrap = ctk.CTkFrame(panel, fg_color=C_CARD2, corner_radius=10)
-        text_wrap.pack(fill="both", expand=True, padx=14, pady=(0, 14))
-        self.txt = tk.Text(text_wrap, wrap="word", bd=0, relief="flat", bg="#FBFBFC",
-                           fg="#1A1D21", insertbackground="#1A1D21", font=(UI_FONT, 10),
-                           padx=14, pady=12, spacing1=2, spacing3=4, height=8)
+        text_wrap.pack(fill="both", expand=True, padx=16, pady=(0, 16))
+        self.txt = tk.Text(text_wrap, wrap="word", bd=0, relief="flat", bg="#FAFBFC",
+                           fg="#2A2F36", insertbackground="#2A2F36", font=(UI_FONT, 10),
+                           padx=14, pady=12, spacing1=3, spacing3=5, height=8,
+                           selectbackground="#FFE2D4")
         tsb = ttk.Scrollbar(text_wrap, orient="vertical", command=self.txt.yview)
         self.txt.configure(yscrollcommand=tsb.set)
         self.txt.pack(side="left", fill="both", expand=True, padx=(2, 0), pady=2)
         tsb.pack(side="right", fill="y")
 
     def _style_tree(self):
+        dark = bool(self.sw_dark.get()) if hasattr(self, "sw_dark") else False
+        bg = "#16191F" if dark else "#FFFFFF"
+        fg = "#D6DAE0" if dark else "#1A1D21"
+        sel = "#2A1E18" if dark else "#FFF3EC"
         st = ttk.Style()
-        st.configure("Treeview", background="#FFFFFF", fieldbackground="#FFFFFF",
-                     foreground="#1A1D21", rowheight=29, borderwidth=0, font=(UI_FONT, 10))
-        st.configure("Treeview.Heading", background="#FFFFFF", foreground="#7C848E",
+        st.configure("Fanqie.Treeview", background=bg, fieldbackground=bg, foreground=fg,
+                     rowheight=28, borderwidth=0, font=(UI_FONT, 9))
+        st.configure("Fanqie.Treeview.Heading", background=bg, foreground="#8A93A2",
                      relief="flat", font=(UI_FONT, 9))
-        st.map("Treeview", background=[("selected", "#FFF3EC")],
-               foreground=[("selected", "#1A1D21")])
-        st.configure("Vertical.TScrollbar", background="#DDE0E4", troughcolor="#FFFFFF",
-                     borderwidth=0, arrowsize=12)
+        st.map("Fanqie.Treeview", background=[("selected", sel)],
+               foreground=[("selected", "#FFB08A" if dark else "#E2540F")])
+        st.configure("Vertical.TScrollbar", background="#2A2F38" if dark else "#DDE0E4",
+                     troughcolor=bg, borderwidth=0, arrowsize=10)
 
     def _build_bottom(self):
-        bar = ctk.CTkFrame(self.root, fg_color=C_CARD, corner_radius=14)
-        bar.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 14))
+        bar = ctk.CTkFrame(self.root, fg_color=C_CARD, corner_radius=16)
+        bar.grid(row=2, column=0, sticky="ew", padx=18, pady=(0, 16))
         bar.grid_columnconfigure(1, weight=1)
 
         ctk.CTkLabel(bar, text="保存到", font=ftc(9), text_color=C_MUTED).grid(
-            row=0, column=0, padx=(16, 6), pady=(12, 4), sticky="w")
+            row=0, column=0, padx=(18, 8), pady=(12, 4), sticky="w")
         self.var_dir = tk.StringVar(value=str(Path.home() / "Downloads" / "番茄小说"))
-        self.entry_dir = ctk.CTkEntry(bar, textvariable=self.var_dir, height=32, corner_radius=8,
-                                      font=ftc(10), fg_color=C_CARD2, border_color=C_LINE,
-                                      text_color=C_TEXT)
-        self.entry_dir.grid(row=0, column=1, columnspan=2, sticky="ew", pady=(12, 4))
-        ctk.CTkButton(bar, text="浏览", width=64, height=32, corner_radius=8, font=ftc(10),
+        ctk.CTkEntry(bar, textvariable=self.var_dir, height=32, corner_radius=8, font=ftc(10),
+                     fg_color=C_CARD2, border_color=C_LINE, text_color=C_TEXT).grid(
+            row=0, column=1, columnspan=2, sticky="ew", pady=(12, 4))
+        ctk.CTkButton(bar, text="浏览", width=62, height=32, corner_radius=8, font=ftc(10),
                       fg_color=C_CARD2, hover_color=C_SOFT, text_color=C_TEXT,
                       command=self.pick_dir).grid(row=0, column=3, padx=8, pady=(12, 4))
 
         ctk.CTkLabel(bar, text="线程", font=ftc(9), text_color=C_MUTED).grid(
-            row=0, column=4, padx=(4, 4), pady=(12, 4))
+            row=0, column=4, padx=(4, 6), pady=(12, 4))
         self.var_th = tk.IntVar(value=8)
-        ctk.CTkEntry(bar, textvariable=self.var_th, width=52, height=32, corner_radius=8,
-                     font=ftc(10), fg_color=C_CARD2, border_color=C_LINE,
-                     text_color=C_TEXT).grid(row=0, column=5, padx=(0, 10), pady=(12, 4))
+        ctk.CTkEntry(bar, textvariable=self.var_th, width=50, height=32, corner_radius=8,
+                     font=ftc(10), fg_color=C_CARD2, border_color=C_LINE, text_color=C_TEXT).grid(
+            row=0, column=5, padx=(0, 12), pady=(12, 4))
 
         self.btn_dl_all = ctk.CTkButton(bar, text="下载全书", width=104, height=32, corner_radius=8,
                                         font=ftc(10, True), fg_color=C_PRIMARY,
-                                        hover_color=C_PRIMARY_H, command=lambda: self.start_download(False))
+                                        hover_color=C_PRIMARY_H,
+                                        command=lambda: self.start_download(False))
         self.btn_dl_all.grid(row=0, column=6, padx=(0, 8), pady=(12, 4))
-        self.btn_dl_sel = ctk.CTkButton(bar, text="下载选中", width=96, height=32, corner_radius=8,
+        self.btn_dl_sel = ctk.CTkButton(bar, text="下载选中", width=94, height=32, corner_radius=8,
                                         font=ftc(10), fg_color=C_SOFT, hover_color=C_SOFT_H,
-                                        text_color=C_PRIMARY, command=lambda: self.start_download(True))
+                                        text_color=C_PRIMARY,
+                                        command=lambda: self.start_download(True))
         self.btn_dl_sel.grid(row=0, column=7, padx=(0, 8), pady=(12, 4))
-        self.btn_stop = ctk.CTkButton(bar, text="停止", width=64, height=32, corner_radius=8,
+        self.btn_stop = ctk.CTkButton(bar, text="停止", width=62, height=32, corner_radius=8,
                                       font=ftc(10), fg_color=C_CARD2, hover_color=C_SOFT,
                                       text_color=C_MUTED, command=self.stop_download)
-        self.btn_stop.grid(row=0, column=8, padx=(0, 16), pady=(12, 4))
+        self.btn_stop.grid(row=0, column=8, padx=(0, 18), pady=(12, 4))
 
-        self.pb = ctk.CTkProgressBar(bar, height=8, corner_radius=4, progress_color=C_PRIMARY,
-                                     fg_color=C_CARD2)
-        self.pb.grid(row=1, column=0, columnspan=9, sticky="ew", padx=16, pady=(0, 4))
+        self.pb = ctk.CTkProgressBar(bar, height=6, corner_radius=3, progress_color=C_PRIMARY,
+                                     fg_color=C_CARD3)
+        self.pb.grid(row=1, column=0, columnspan=9, sticky="ew", padx=18, pady=(0, 4))
         self.pb.set(0)
         self.lbl_status = ctk.CTkLabel(bar, text="就绪", font=ftc(9), text_color=C_MUTED, anchor="w")
-        self.lbl_status.grid(row=2, column=0, columnspan=9, sticky="ew", padx=16, pady=(0, 10))
+        self.lbl_status.grid(row=2, column=0, columnspan=9, sticky="ew", padx=18, pady=(0, 10))
 
     # ---------------- 主题 ----------------
     def _toggle_theme(self):
         dark = bool(self.sw_dark.get())
         ctk.set_appearance_mode("dark" if dark else "light")
-        bg = "#0E1014" if dark else "#FBFBFC"
-        fg = "#D7DBE0" if dark else "#1A1D21"
+        bg = "#1B1F26" if dark else "#FBFBFC"
+        fg = "#D6DAE0" if dark else "#171A1F"
         self.txt.configure(bg=bg, fg=fg, insertbackground=fg)
-        for child in self.root.winfo_children():
-            if isinstance(child, tk.Frame):
-                child.configure(bg=bg)
+        for w in (getattr(self, "tree", None),):
+            if w is not None:
+                self.root.after(50, self._refresh_tree_style)
+
+    def _refresh_tree_style(self):
+        self._style_tree()
 
     # ---------------- 队列 ----------------
     def log(self, msg):
@@ -1386,9 +1560,9 @@ class App:
                 elif kind == "index_progress":
                     cur, total, written = payload
                     self.pb.set(min(1.0, cur / max(1, total)))
-                    self.lbl_status.configure(text=f"建立索引 {cur}/{total} 页，已写入 {written} 本")
+                    self.lbl_status.configure(text=f"抓取索引 {cur}/{total} 页，已写入 {written} 本")
                 elif kind == "index_count":
-                    self.lbl_index.configure(text=f"索引：{payload} 本")
+                    self.lbl_index.configure(text=f"{payload} 本")
                     self.pb.set(0)
                 elif kind == "books":
                     items, title, hint = payload
@@ -1410,18 +1584,46 @@ class App:
                     self._set_busy(payload)
                 elif kind == "page":
                     self.lbl_page.configure(text=f"第 {self.page + 1} / {max(1, self.page_total)} 页")
+                elif kind == "append_books":
+                    more, has_more = payload
+                    if more:
+                        prev = self.cards.selected
+                        self.books = self.books + more
+                        self.cards.set_items(self.books)
+                        if prev is not None and prev < len(self.books):
+                            self.cards.selected = prev
+                            self.cards._paint()
+                        self.lbl_hint.configure(text=f"{len(self.books)} 本")
+                    self.btn_more.configure(text="加载更多" if has_more else "没有更多了",
+                                            state="normal" if has_more else "disabled")
+                elif kind == "more_state":
+                    self.btn_more.configure(text="加载更多" if payload else "没有更多了",
+                                            state="normal" if payload else "disabled")
+                elif kind == "cover":
+                    idx, img = payload
+                    self.cards.set_cover(idx, img)
+                elif kind == "cover_big":
+                    img = payload
+                    try:
+                        for ch in self.cover_big.winfo_children():
+                            ch.destroy()
+                        cimg = ctk.CTkImage(light_image=img, dark_image=img, size=(78, 104))
+                        self._cover_big_ref = cimg
+                        ctk.CTkLabel(self.cover_big, text="", image=cimg).pack(fill="both", expand=True)
+                    except Exception:
+                        pass
                 elif kind == "done":
                     messagebox.showinfo("完成", payload)
                     self._set_busy(False)
         except queue.Empty:
             pass
-        self.root.after(80, self._pump)
+        self.root.after(70, self._pump)
 
     def _set_busy(self, flag):
         self.busy = flag
         state = "disabled" if flag else "normal"
         for b in (self.btn_dl_all, self.btn_dl_sel, self.btn_search, self.btn_lib,
-                  self.btn_index, self.btn_index_deep):
+                  self.btn_index):
             b.configure(state=state)
         self.btn_stop.configure(state="normal" if flag else "disabled")
 
@@ -1436,13 +1638,13 @@ class App:
                     traceback.print_exc()
         threading.Thread(target=runner, daemon=True).start()
 
-    # ---------------- 初始化 ----------------
+    # ---------------- 数据 ----------------
     def _boot(self):
         self.ui_q.put(("index_count", index_count()))
         try:
             cats = library_categories()
         except Exception as e:
-            self.ui_q.put(("status", f"分类加载失败：{e}"))
+            self.ui_q.put(("status", f"标签加载失败：{e}"))
             return
         self.ui_q.put(("cats", cats))
 
@@ -1460,6 +1662,18 @@ class App:
         self.opt_tag.configure(values=[n for n, _ in self.tag_opts])
         self.opt_tag.set("全部")
 
+    def _hook_cover(self, idx, url, holder):
+        """卡片创建时触发异步封面下载。"""
+        if not url:
+            return
+
+        def load():
+            img = load_cover(url, (52, 70))
+            if img is not None:
+                self.ui_q.put(("cover", (idx, img)))
+
+        threading.Thread(target=load, daemon=True).start()
+
     # ---------------- 动作 ----------------
     def _switch_mode(self, value):
         self.mode = value
@@ -1468,15 +1682,13 @@ class App:
         gender = {"全部": -1, "男频": 0, "女频": 1}[self.opt_gender.get()]
         status = {"全部": -1, "完结": 0, "连载": 1}[self.opt_status.get()]
         cat = -1
-        name = self.opt_cat.get()
         for n, v in self.main_opts:
-            if n == name:
+            if n == self.opt_cat.get():
                 cat = v
                 break
         if cat == -1:
-            tname = self.opt_tag.get()
             for n, v in self.tag_opts:
-                if n == tname:
+                if n == self.opt_tag.get():
                     cat = v
                     break
         words = -1
@@ -1493,7 +1705,7 @@ class App:
     def do_search(self):
         kw = self.entry_kw.get().strip()
         if not kw:
-            self.status("先输入书名、作者或关键词")
+            self.status("先输入书名、作者或书号")
             return
         if self.busy:
             return
@@ -1504,11 +1716,33 @@ class App:
         self.bg(self._search_worker, kw, mode)
 
     def _search_worker(self, kw, mode):
+        meta = {}
         try:
-            items = search_books(kw, mode=mode, log=self.log)
-            self.ui_q.put(("index_count", index_count()))
-            hint = f"找到 {len(items)} 本" if items else "没找到；可先建立索引再搜"
+            items = search_books(kw, mode=mode, limit=60, log=self.log, meta=meta)
+            self.search_kw = kw
+            self.search_offset = meta.get("next_offset", len(items))
+            self.search_has_more = bool(meta.get("has_more"))
+            hint = f"{len(items)} 本" if items else "没找到，换个关键词或贴书籍链接"
             self.ui_q.put(("books", (items, "搜索结果", hint)))
+            self.ui_q.put(("more_state", self.search_has_more))
+        finally:
+            self.ui_q.put(("busy", False))
+
+    def load_more(self):
+        if self.busy or not self.search_kw or not self.search_has_more:
+            return
+        self._set_busy(True)
+        self.btn_more.configure(text="加载中…")
+        self.bg(self._more_worker)
+
+    def _more_worker(self):
+        meta = {}
+        try:
+            more = search_books(self.search_kw, limit=30, offset=self.search_offset,
+                                log=self.log, meta=meta)
+            self.search_offset = meta.get("next_offset", self.search_offset + len(more))
+            self.search_has_more = bool(meta.get("has_more"))
+            self.ui_q.put(("append_books", (more, self.search_has_more)))
         finally:
             self.ui_q.put(("busy", False))
 
@@ -1520,6 +1754,8 @@ class App:
         self._run_library()
 
     def _run_library(self):
+        self.search_kw = ""
+        self.btn_more.configure(text="加载更多", state="disabled")
         self.lbl_hint.configure(text="加载中…")
         self.bg(self._library_worker, self._current_filter(), self.page)
 
@@ -1544,22 +1780,16 @@ class App:
         self._run_library()
 
     def do_index(self):
-        self._index(deep=False)
-
-    def do_index_deep(self):
-        self._index(deep=True)
-
-    def _index(self, deep):
         if self.busy:
             return
         self._set_busy(True)
-        self.lbl_status.configure(text="开始建立索引…")
-        self.bg(self._index_worker, deep)
+        self.lbl_status.configure(text="开始抓取索引…")
+        self.bg(self._index_worker)
 
-    def _index_worker(self, deep):
+    def _index_worker(self):
         try:
             build_index(progress=lambda c, t, w: self.ui_q.put(("index_progress", (c, t, w))),
-                        should_stop=lambda: self.stop_flag, deep=deep, log=self.log)
+                        should_stop=lambda: self.stop_flag, log=self.log)
             self.ui_q.put(("index_count", index_count()))
             self.ui_q.put(("status", f"索引完成，共 {index_count()} 本"))
         finally:
@@ -1571,16 +1801,39 @@ class App:
         meta = "  ·  ".join(x for x in [
             book.get("author"), (f"{book['words'] / 10000:.1f} 万字" if book.get("words") else ""),
             book.get("status")] if x)
-        abstract = (book.get("abstract") or "")[:80]
-        self.lbl_book_meta.configure(text=(meta + ("\n" + abstract if abstract else "")))
+        self.lbl_book_meta.configure(text=meta or "作者未知")
+        self.lbl_abstract.configure(text=(book.get("abstract") or "")[:110])
+        try:
+            self.lbl_cover_ph.configure(text=(book.get("name") or "?")[:1])
+        except Exception:
+            pass
+        for ch in self.cover_big.winfo_children():
+            if ch is not self.lbl_cover_ph:
+                ch.destroy()
+        url = book.get("cover") or ""
+        if url:
+            threading.Thread(target=self._load_big_cover, args=(url,), daemon=True).start()
         self.bg(self._chapters_worker, book)
+
+    def _load_big_cover(self, url):
+        img = load_cover(url, (78, 104))
+        if img is not None:
+            self.ui_q.put(("cover_big", img))
 
     def _chapters_worker(self, book):
         try:
             info = book_detail(book["book_id"], with_chapters=True)
+            self._auto_skip = 0
             self.ui_q.put(("chapters", info))
-        except Exception as e:
-            self.ui_q.put(("status", f"目录获取失败：{e}"))
+        except Exception:
+            name = book.get("name") or "这本书"
+            idx = self.cards.selected
+            self._auto_skip = getattr(self, "_auto_skip", 0) + 1
+            if idx is not None and idx + 1 < len(self.books) and self._auto_skip <= 3:
+                self.ui_q.put(("status", f"《{name}》打不开（已下架或仅 App 可读），自动换下一本…"))
+                self.root.after(200, lambda: self.cards._click(idx + 1))
+            else:
+                self.ui_q.put(("status", f"《{name}》打不开，换一本或直接贴书籍链接"))
 
     def fill_chapters(self, info):
         self.book = info
@@ -1593,7 +1846,7 @@ class App:
             for ch in vol["chapters"]:
                 n += 1
                 self.tree.insert(node, "end", iid=ch["id"],
-                                 text=f"   {n}. {ch['title']}" + ("  🔒" if ch.get("pay") else ""))
+                                 text=f"   {n}. {ch['title']}" + ("   🔒" if ch.get("pay") else ""))
                 self.chapters.append(ch)
         self.lbl_status.configure(text=f"《{info['name']}》共 {len(self.chapters)} 章")
 
