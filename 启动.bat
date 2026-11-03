@@ -15,11 +15,11 @@ if not defined PYDIR (
     exit /b
 )
 
-rem 检查界面依赖 customtkinter，缺了自动装
-"%PYDIR%\python.exe" -c "import customtkinter" >nul 2>nul
+rem 界面依赖 pywebview（WebView2 渲染），缺了自动装
+"%PYDIR%\python.exe" -c "import webview" >nul 2>nul
 if errorlevel 1 (
-    echo 首次运行，正在安装界面组件 customtkinter ...
-    "%PYDIR%\python.exe" -m pip install customtkinter
+    echo 首次运行，正在安装界面组件 pywebview ...
+    "%PYDIR%\python.exe" -m pip install pywebview
 )
 
 if exist "%PYDIR%\pythonw.exe" (

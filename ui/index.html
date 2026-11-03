@@ -1,0 +1,896 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>番茄小说下载器</title>
+<style>
+:root{
+  --bg:#0A0B10; --surface:#11131A; --surface-2:#171A23; --surface-3:#1E222D;
+  --border:#222634; --border-strong:#2E3444;
+  --text:#E8EAED; --text-2:#A8B0BD; --text-3:#6E7683;
+  --accent:#7C8CFF; --accent-soft:rgba(124,140,255,.16);
+  --green:#3DDC84; --blue:#5EC8E8;
+  --ease-out:cubic-bezier(.23,1,.32,1);
+  --ease-drawer:cubic-bezier(.32,.72,0,1);
+  --r-lg:14px; --r-md:10px; --r-sm:8px;
+}
+html[data-theme="light"]{
+  --bg:#F6F7F9; --surface:#FFFFFF; --surface-2:#F7F8FA; --surface-3:#EFF1F4;
+  --border:#E7EAEE; --border-strong:#D9DDE3;
+  --text:#171A1F; --text-2:#5C6470; --text-3:#8C94A0;
+  --accent:#4F5BD5; --accent-soft:rgba(79,91,213,.10);
+  --green:#0E9F6E; --blue:#0E7490;
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{
+  margin:0; background:var(--bg); color:var(--text);
+  font:13px/1.5 "PingFang SC","Microsoft YaHei UI","Segoe UI",system-ui,sans-serif;
+  -webkit-font-smoothing:antialiased; overflow:hidden;
+  transition:background .2s ease,color .2s ease;
+}
+button,input,select{font:inherit;color:inherit}
+::-webkit-scrollbar{width:10px;height:10px}
+::-webkit-scrollbar-thumb{background:var(--border-strong);border-radius:8px;border:3px solid transparent;background-clip:content-box}
+::-webkit-scrollbar-thumb:hover{background:var(--text-3);background-clip:content-box}
+::-webkit-scrollbar-track{background:transparent}
+
+.app{display:grid;grid-template-columns:236px 1fr;height:100vh}
+
+/* ---------- 侧栏 ---------- */
+.side{
+  background:var(--surface);border-right:1px solid var(--border);
+  display:flex;flex-direction:column;min-height:0;
+}
+.brand{padding:18px 18px 14px;display:flex;align-items:center;gap:10px}
+.brand .logo{
+  width:26px;height:26px;border-radius:8px;flex:none;color:#fff;
+  font-size:12px;font-weight:700;
+  background:linear-gradient(140deg,#6D7BFF,#A78BFA);
+  display:grid;place-items:center;font-size:14px;
+  box-shadow:0 2px 12px rgba(109,123,255,.35);
+}
+.brand h1{margin:0;font-size:14px;font-weight:600;letter-spacing:.2px}
+.brand small{display:block;font-size:11px;color:var(--text-3);font-weight:400;margin-top:1px}
+
+.side-body{padding:0 12px 12px;overflow-y:auto;flex:1;min-height:0}
+.group{margin-bottom:14px}
+.group>.lbl{
+  font-size:11px;color:var(--text-3);padding:0 6px 6px;letter-spacing:.3px;
+}
+.seg{display:flex;gap:4px;padding:3px;background:var(--surface-2);border-radius:var(--r-sm)}
+.seg button{
+  flex:1;border:0;background:transparent;color:var(--text-2);padding:6px 4px;
+  border-radius:6px;cursor:pointer;font-size:11.5px;
+  transition:background .15s ease,color .15s ease,transform .12s var(--ease-out);
+}
+.seg button:hover{color:var(--text)}
+.seg button[aria-pressed="true"]{background:var(--surface-3);color:var(--text);font-weight:600}
+.seg button:active{transform:scale(.97)}
+
+select{
+  width:100%;padding:8px 10px;border-radius:var(--r-sm);
+  background:var(--surface-2);border:1px solid var(--border);
+  color:var(--text);outline:none;cursor:pointer;appearance:none;
+  background-image:linear-gradient(45deg,transparent 50%,var(--text-3) 50%),linear-gradient(135deg,var(--text-3) 50%,transparent 50%);
+  background-position:calc(100% - 15px) 15px,calc(100% - 10px) 15px;
+  background-size:5px 5px,5px 5px;background-repeat:no-repeat;
+  transition:border-color .15s ease,background-color .15s ease;
+}
+select:hover{border-color:var(--border-strong)}
+select:focus{border-color:var(--accent)}
+
+.btn{
+  border:1px solid var(--border);background:var(--surface-2);color:var(--text);
+  padding:8px 12px;border-radius:var(--r-sm);cursor:pointer;font-size:12px;
+  transition:background .15s ease,border-color .15s ease,transform .12s var(--ease-out);
+}
+.btn:hover{background:var(--surface-3);border-color:var(--border-strong)}
+.btn:active{transform:scale(.97)}
+.btn.primary{background:var(--accent);border-color:transparent;color:#fff;font-weight:600}
+.btn.primary:hover{filter:brightness(1.06)}
+.btn.ghost{background:transparent}
+.btn.wide{width:100%}
+.btn[disabled]{opacity:.45;cursor:not-allowed;transform:none!important}
+
+.index-card{
+  margin-top:auto;padding:12px;border-radius:var(--r-md);
+  background:var(--surface-2);border:1px solid var(--border);
+}
+.index-card .row{display:flex;align-items:baseline;justify-content:space-between;margin-bottom:8px}
+.index-card b{font-size:15px;font-variant-numeric:tabular-nums}
+.index-card span{font-size:11px;color:var(--text-3)}
+.bar{height:4px;border-radius:4px;background:var(--surface-3);overflow:hidden}
+.bar>i{display:block;height:100%;width:0;background:var(--accent);border-radius:4px;transition:width .3s var(--ease-out)}
+
+/* ---------- 主区 ---------- */
+.main{display:flex;flex-direction:column;min-width:0;min-height:0}
+.topbar{
+  padding:14px 20px;display:flex;align-items:center;gap:10px;
+  border-bottom:1px solid var(--border);background:var(--surface);
+}
+.searchwrap{position:relative;flex:1;max-width:620px}
+.searchwrap input{
+  width:100%;padding:10px 14px 10px 36px;border-radius:10px;
+  background:var(--surface-2);border:1px solid var(--border);
+  outline:none;transition:border-color .15s ease,background .15s ease,box-shadow .15s ease;
+}
+.searchwrap input::placeholder{color:var(--text-3)}
+.searchwrap input:focus{
+  border-color:var(--accent);background:var(--surface);
+  box-shadow:0 0 0 3px var(--accent-soft);
+}
+.searchwrap svg{position:absolute;left:12px;top:50%;transform:translateY(-50%);color:var(--text-3)}
+.topbar .modes{display:flex;gap:4px;padding:3px;background:var(--surface-2);border-radius:var(--r-sm)}
+.topbar .modes button{
+  border:0;background:transparent;color:var(--text-2);padding:7px 12px;border-radius:6px;
+  cursor:pointer;font-size:12px;white-space:nowrap;
+  transition:background .15s ease,color .15s ease,transform .12s var(--ease-out);
+}
+.topbar .modes button:hover{color:var(--text)}
+.topbar .modes button[aria-pressed="true"]{background:var(--surface-3);color:var(--text);font-weight:600}
+.topbar .modes button:active{transform:scale(.97)}
+.iconbtn{
+  width:34px;height:34px;border-radius:9px;border:1px solid var(--border);
+  background:var(--surface-2);color:var(--text-2);cursor:pointer;display:grid;place-items:center;
+  transition:background .15s ease,color .15s ease,transform .12s var(--ease-out);
+}
+.iconbtn:hover{background:var(--surface-3);color:var(--text)}
+.iconbtn:active{transform:scale(.94)}
+
+.content{display:grid;grid-template-columns:1fr;min-height:0;flex:1}
+.content.with-detail{grid-template-columns:1fr 460px}
+
+.listpane{display:flex;flex-direction:column;min-height:0;min-width:0}
+.listhead{
+  padding:14px 20px 8px;display:flex;align-items:baseline;gap:10px;
+}
+.listhead h2{margin:0;font-size:14px;font-weight:600}
+.listhead .hint{font-size:11.5px;color:var(--text-3)}
+.list{flex:1;overflow-y:auto;padding:4px 14px 20px}
+
+/* 卡片 */
+.card{
+  display:flex;gap:12px;padding:11px;border-radius:var(--r-lg);
+  border:1px solid transparent;cursor:pointer;position:relative;
+  transform:translateY(0);
+  transition:background .15s ease,border-color .15s ease,transform .18s var(--ease-out);
+  animation:cardIn .32s var(--ease-out) both;
+}
+@keyframes cardIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
+.card:hover{background:var(--surface);border-color:var(--border);transform:translateY(-1px)}
+.card:active{transform:scale(.995)}
+.card.sel{background:var(--surface);border-color:var(--border-strong)}
+.card.sel::before{
+  content:"";position:absolute;left:0;top:12px;bottom:12px;width:3px;
+  border-radius:0 3px 3px 0;background:var(--accent);
+  animation:barIn .2s var(--ease-out);
+}
+@keyframes barIn{from{transform:scaleY(.3);opacity:0}to{transform:scaleY(1);opacity:1}}
+.cover{
+  width:52px;height:70px;border-radius:9px;flex:none;overflow:hidden;
+  background:var(--surface-3);display:grid;place-items:center;
+  color:var(--text-3);font-size:17px;font-weight:600;
+  box-shadow:0 2px 8px rgba(0,0,0,.25);
+}
+.cover img{width:100%;height:100%;object-fit:cover;display:block}
+.card .body{min-width:0;flex:1;display:flex;flex-direction:column;justify-content:center;gap:3px}
+.card .title{font-size:13.5px;font-weight:600;letter-spacing:.1px;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.card .meta{font-size:11.5px;color:var(--text-3);display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.card .abs{font-size:11.5px;color:var(--text-3);opacity:.85;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.badge{
+  font-size:10px;padding:1px 6px;border-radius:5px;font-weight:600;
+  background:var(--surface-3);color:var(--text-2);
+}
+.badge.done{color:var(--green);background:rgba(61,220,132,.12)}
+.badge.ongoing{color:var(--blue);background:rgba(107,168,255,.12)}
+.chip{
+  font-size:10px;padding:1px 7px;border-radius:5px;
+  color:var(--accent);background:var(--accent-soft);
+}
+.why{font-size:10.5px;color:var(--accent);opacity:.9}
+
+.empty{
+  height:100%;display:grid;place-content:center;justify-items:center;gap:10px;
+  color:var(--text-3);font-size:12.5px;text-align:center;
+}
+.empty .big{font-size:30px;opacity:.5}
+
+/* 骨架 */
+.skel{display:flex;gap:12px;padding:11px}
+.skel .s-cover{width:52px;height:70px;border-radius:9px}
+.skel .s-line{height:10px;border-radius:6px;margin:5px 0}
+.shimmer{background:linear-gradient(90deg,var(--surface-2) 25%,var(--surface-3) 37%,var(--surface-2) 63%);
+  background-size:400% 100%;animation:shim 1.4s ease infinite}
+@keyframes shim{from{background-position:100% 0}to{background-position:-100% 0}}
+
+.listfoot{padding:8px 20px 16px;display:flex;align-items:center;gap:10px;border-top:1px solid var(--border)}
+
+/* 详情抽屉 */
+.detail{
+  border-left:1px solid var(--border);background:var(--surface);
+  display:none;flex-direction:column;min-height:0;
+}
+.detail.open{display:flex;animation:panelIn .28s var(--ease-drawer)}
+@keyframes panelIn{from{opacity:0;transform:translateX(12px)}to{opacity:1;transform:translateX(0)}}
+.dhead{display:flex;gap:14px;padding:18px 18px 12px}
+.dhead .cover{width:74px;height:100px;border-radius:10px}
+.dhead .info{min-width:0;flex:1}
+.dhead h3{margin:0 0 4px;font-size:15px;font-weight:600;line-height:1.35}
+.dhead .sub{font-size:11.5px;color:var(--text-3);display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.dabs{padding:0 18px 12px;font-size:11.5px;color:var(--text-3);line-height:1.6;
+  max-height:66px;overflow:hidden;position:relative}
+.dabs::after{content:"";position:absolute;left:0;right:0;bottom:0;height:24px;
+  background:linear-gradient(transparent,var(--surface))}
+.tabs{display:flex;gap:2px;padding:0 14px;border-bottom:1px solid var(--border)}
+.tabs button{
+  border:0;background:transparent;color:var(--text-3);padding:9px 12px;cursor:pointer;
+  font-size:12px;position:relative;transition:color .15s ease;
+}
+.tabs button:hover{color:var(--text-2)}
+.tabs button[aria-pressed="true"]{color:var(--text);font-weight:600}
+.tabs button[aria-pressed="true"]::after{
+  content:"";position:absolute;left:10px;right:10px;bottom:-1px;height:2px;
+  background:var(--accent);border-radius:2px 2px 0 0;
+  animation:tabIn .2s var(--ease-out);
+}
+@keyframes tabIn{from{transform:scaleX(.4);opacity:0}to{transform:scaleX(1);opacity:1}}
+.tabpane{flex:1;overflow-y:auto;min-height:0;padding:10px 14px 16px}
+.vol{font-size:11px;color:var(--text-3);padding:8px 6px 4px;letter-spacing:.2px}
+.chap{
+  padding:7px 10px;border-radius:7px;cursor:pointer;font-size:12.5px;color:var(--text-2);
+  display:flex;gap:8px;align-items:center;
+  transition:background .12s ease,color .12s ease;
+}
+.chap:hover{background:var(--surface-2);color:var(--text)}
+.chap.cur{background:var(--accent-soft);color:var(--accent)}
+.chap .lock{font-size:10px;opacity:.6}
+.reader{white-space:pre-wrap;font-size:13px;line-height:1.85;color:var(--text-2)}
+.reader .img{color:var(--text-3);font-size:11px}
+
+/* 底部 */
+.footer{
+  border-top:1px solid var(--border);background:var(--surface);
+  padding:10px 20px;display:flex;align-items:center;gap:10px;
+}
+.footer .path{
+  flex:1;min-width:0;padding:8px 10px;border-radius:8px;border:1px solid var(--border);
+  background:var(--surface-2);color:var(--text-2);font-size:11.5px;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+}
+.footer .th{display:flex;align-items:center;gap:6px;font-size:11.5px;color:var(--text-3)}
+.footer .th input{
+  width:44px;padding:6px 8px;border-radius:7px;border:1px solid var(--border);
+  background:var(--surface-2);color:var(--text);text-align:center;outline:none;
+}
+.progress{width:150px;height:4px;border-radius:4px;background:var(--surface-3);overflow:hidden}
+.progress>i{display:block;height:100%;width:0;background:var(--accent);transition:width .25s var(--ease-out)}
+.status{font-size:11px;color:var(--text-3);min-width:90px;text-align:right;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+/* 弹层 */
+.modal{
+  position:fixed;inset:0;background:rgba(0,0,0,.5);display:none;
+  place-items:center;z-index:50;backdrop-filter:blur(3px);
+}
+.modal.open{display:grid;animation:fadeIn .18s ease-out}
+@keyframes fadeIn{from{opacity:0}to{opacity:1}}
+.modal .box{
+  width:440px;background:var(--surface);border:1px solid var(--border-strong);
+  border-radius:16px;padding:22px;box-shadow:0 24px 60px rgba(0,0,0,.5);
+  animation:boxIn .24s var(--ease-out);
+}
+@keyframes boxIn{from{opacity:0;transform:scale(.96) translateY(6px)}to{opacity:1;transform:scale(1) translateY(0)}}
+.modal h3{margin:0 0 4px;font-size:15px}
+.modal p{margin:0 0 16px;font-size:11.5px;color:var(--text-3)}
+.modal label{display:block;font-size:11px;color:var(--text-3);margin:12px 0 5px}
+.modal input{
+  width:100%;padding:9px 11px;border-radius:8px;border:1px solid var(--border);
+  background:var(--surface-2);color:var(--text);outline:none;
+  transition:border-color .15s ease,box-shadow .15s ease;
+}
+.modal input:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+.modal .actions{display:flex;gap:8px;justify-content:flex-end;margin-top:18px}
+.toast{
+  position:fixed;left:50%;bottom:28px;transform:translate(-50%,10px);
+  background:var(--surface-3);border:1px solid var(--border-strong);color:var(--text);
+  padding:9px 16px;border-radius:10px;font-size:12px;opacity:0;pointer-events:none;
+  transition:opacity .2s ease,transform .2s var(--ease-out);z-index:60;
+}
+.toast.show{opacity:1;transform:translate(-50%,0)}
+</style>
+</head>
+<body>
+<script>
+window.__diag = [];
+window.onerror = function(m, src, line, col) {
+  window.__diag.push(m + " @" + line + ":" + col);
+  var el = document.querySelector("#status");
+  if (el) el.textContent = "JS错误: " + m;
+  return false;
+};
+window.addEventListener("unhandledrejection", function(e) {
+  var m = (e.reason && (e.reason.message || e.reason)) || "unknown";
+  window.__diag.push("promise: " + m);
+  var el = document.querySelector("#status");
+  if (el) el.textContent = "JS错误: " + m;
+});
+</script>
+<div class="app">
+  <aside class="side">
+    <div class="brand">
+      <div class="logo">番</div>
+      <div>
+        <h1>番茄小说下载器</h1>
+        <small>搜索 · 预览 · 导出 TXT</small>
+      </div>
+    </div>
+    <div class="side-body">
+      <div class="group">
+        <div class="lbl">频道</div>
+        <div class="seg" id="segGender">
+          <button data-v="-1" aria-pressed="true">全部</button>
+          <button data-v="0">男频</button>
+          <button data-v="1">女频</button>
+        </div>
+      </div>
+      <div class="group">
+        <div class="lbl">分类</div>
+        <select id="selCat"><option value="-1">全部</option></select>
+      </div>
+      <div class="group">
+        <div class="lbl">标签（情节 / 角色 / 主题）</div>
+        <select id="selTag"><option value="-1">全部</option></select>
+      </div>
+      <div class="group">
+        <div class="lbl">状态</div>
+        <div class="seg" id="segStatus">
+          <button data-v="-1" aria-pressed="true">全部</button>
+          <button data-v="0">完结</button>
+          <button data-v="1">连载</button>
+        </div>
+      </div>
+      <div class="group">
+        <div class="lbl">字数</div>
+        <select id="selWords">
+          <option value="-1">全部</option>
+          <option value="0">30 万以下</option>
+          <option value="1">30–50 万</option>
+          <option value="2">50–100 万</option>
+          <option value="3">100–200 万</option>
+          <option value="4">200 万以上</option>
+        </select>
+      </div>
+      <div class="group">
+        <div class="lbl">排序</div>
+        <select id="selSort">
+          <option value="0">默认</option>
+          <option value="1">最新</option>
+          <option value="2">字数最多</option>
+        </select>
+      </div>
+      <button class="btn wide" id="btnLib">查询书库</button>
+
+      <div class="index-card">
+        <div class="row"><b id="idxCount">0</b><span>本地索引</span></div>
+        <div class="bar"><i id="idxBar"></i></div>
+        <button class="btn wide ghost" id="btnIndex" style="margin-top:10px;font-size:11.5px">更新索引</button>
+      </div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <div class="topbar">
+      <div class="searchwrap">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="11" cy="11" r="7"></circle><path d="M20 20l-3.5-3.5"></path>
+        </svg>
+        <input id="kw" placeholder="搜索书名、作者，或粘贴书籍链接（回车）" autocomplete="off">
+      </div>
+      <div class="modes" id="modes">
+        <button data-v="book" aria-pressed="true">书名/作者</button>
+        <button data-v="content">正文关键词</button>
+        <button data-v="ai">AI 找书</button>
+      </div>
+      <button class="iconbtn" id="btnTheme" title="切换主题">◐</button>
+      <button class="iconbtn" id="btnSettings" title="设置">⚙</button>
+    </div>
+
+    <div class="content" id="content">
+      <section class="listpane">
+        <div class="listhead">
+          <h2 id="listTitle">搜索结果</h2>
+          <span class="hint" id="listHint"></span>
+        </div>
+        <div class="list" id="list"></div>
+        <div class="listfoot">
+          <button class="btn" id="btnPrev" disabled>上一页</button>
+          <span class="hint" id="pageInfo" style="font-size:11.5px;color:var(--text-3)">第 1 页</span>
+          <button class="btn" id="btnNext" disabled>下一页</button>
+          <button class="btn" id="btnMore" disabled style="margin-left:auto">加载更多</button>
+        </div>
+      </section>
+
+      <aside class="detail" id="detail">
+        <div class="dhead">
+          <div class="cover" id="dCover">书</div>
+          <div class="info">
+            <h3 id="dTitle">未选择书籍</h3>
+            <div class="sub" id="dSub">从列表选一本书</div>
+          </div>
+        </div>
+        <div class="dabs" id="dAbs"></div>
+        <div class="tabs" id="dTabs">
+          <button data-t="catalog" aria-pressed="true">目录</button>
+          <button data-t="read">正文</button>
+        </div>
+        <div class="tabpane" id="dPane"></div>
+      </aside>
+    </div>
+
+    <div class="footer">
+      <div class="path" id="outPath" title="点击选择目录">C:\\Users\\Downloads\\番茄小说</div>
+      <div class="th">线程 <input id="threads" value="8"></div>
+      <div class="progress"><i id="prog"></i></div>
+      <span class="status" id="status">就绪</span>
+      <button class="btn primary" id="btnDownload">下载全书</button>
+      <button class="btn" id="btnDownloadSel">下载选中</button>
+      <button class="btn ghost" id="btnStop" disabled>停止</button>
+    </div>
+  </main>
+</div>
+
+<div class="modal" id="modal">
+  <div class="box">
+    <h3>AI 设置</h3>
+    <p>AI 找书需要 DeepSeek API Key，只保存在本机 .cache/ai.json</p>
+    <label>API Key</label>
+    <input id="aiKey" type="password" placeholder="sk-...">
+    <label>接口地址</label>
+    <input id="aiUrl" value="https://api.deepseek.com">
+    <label>模型</label>
+    <input id="aiModel" value="deepseek-chat">
+    <div class="actions">
+      <button class="btn ghost" id="aiCancel">取消</button>
+      <button class="btn primary" id="aiSave">保存</button>
+    </div>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+const AUTO_Q = "__AUTO_Q__";
+/* 前端逻辑：通过 pywebview.api 调 Python 后端 */
+const $ = (s) => document.querySelector(s);
+
+async function api(name, ...args) {
+  const r = await fetch("/api/" + name, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(args),
+  });
+  return await r.json();
+}
+const state = {
+  items: [], mode: "book", kw: "", offset: 0, hasMore: false,
+  page: 0, pageTotal: 1, book: null, chapters: [], tab: "catalog",
+  selected: null, busy: false,
+};
+
+/* ---------------- 工具 ---------------- */
+function toast(msg) {
+  const t = $("#toast");
+  t.textContent = msg;
+  t.classList.add("show");
+  clearTimeout(t._h);
+  t._h = setTimeout(() => t.classList.remove("show"), 2200);
+}
+function setStatus(s) { $("#status").textContent = s; }
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+function fmtWords(n) { return n ? (n / 10000).toFixed(1) + " 万字" : ""; }
+function waitApi() { return Promise.resolve(); }
+
+/* ---------------- 列表 ---------------- */
+function skeleton(n = 6) {
+  const box = $("#list");
+  box.innerHTML = Array.from({ length: n }).map(() => `
+    <div class="skel">
+      <div class="s-cover shimmer"></div>
+      <div style="flex:1">
+        <div class="s-line shimmer" style="width:42%"></div>
+        <div class="s-line shimmer" style="width:26%"></div>
+        <div class="s-line shimmer" style="width:88%"></div>
+      </div>
+    </div>`).join("");
+}
+
+function renderList(items, { keepSelection = false } = {}) {
+  const box = $("#list");
+  if (!items.length) {
+    box.innerHTML = `<div class="empty"><div class="big">◍</div><div>这里还没有内容<br>试试上面的搜索框，或者左边按标签找书</div></div>`;
+    return;
+  }
+  box.innerHTML = items.map((b, i) => {
+    const sel = (!keepSelection ? false : state.selected === b.book_id);
+    const status = b.status === "完结" ? `<span class="badge done">完结</span>`
+      : b.status === "连载中" ? `<span class="badge ongoing">连载</span>` : "";
+    const cat = b.category ? `<span class="chip">${esc(b.category)}</span>` : "";
+    const why = b.why ? `<span class="why">${esc(b.why)}</span>` : "";
+    const cover = b.cover
+      ? `<img src="${esc(b.cover)}" loading="lazy" onerror="this.style.display='none'">`
+      : esc((b.name || "?")[0]);
+    return `
+      <div class="card${sel ? " sel" : ""}" data-id="${esc(b.book_id)}" data-i="${i}"
+           style="animation-delay:${Math.min(i * 22, 260)}ms">
+        <div class="cover">${cover}</div>
+        <div class="body">
+          <div class="title">${esc(b.name || "未知书名")}</div>
+          <div class="meta">${esc(b.author || "未知作者")}${b.words ? " · " + fmtWords(b.words) : ""}
+            ${status}${cat}${why}</div>
+          ${b.abstract ? `<div class="abs">${esc(b.abstract)}</div>` : ""}
+        </div>
+      </div>`;
+  }).join("");
+
+  box.querySelectorAll(".card").forEach((el) => {
+    el.addEventListener("click", () => selectBook(el.dataset.id));
+  });
+}
+
+function markSelected() {
+  document.querySelectorAll(".card").forEach((el) => {
+    el.classList.toggle("sel", el.dataset.id === state.selected);
+  });
+}
+
+/* ---------------- 详情 ---------------- */
+function openDetail(book) {
+  $("#detail").classList.add("open");
+  $("#content").classList.add("with-detail");
+  $("#dTitle").textContent = book.name || "未知书名";
+  const parts = [
+    book.author || "未知作者",
+    fmtWords(book.words),
+    book.status,
+    book.category,
+  ].filter(Boolean);
+  $("#dSub").innerHTML = parts.map((p, i) =>
+    i === 2 ? (book.status === "完结" ? `<span class="badge done">${esc(p)}</span>` : `<span class="badge ongoing">${esc(p)}</span>`)
+      : i === 3 ? `<span class="chip">${esc(p)}</span>` : esc(p)
+  ).join(" · ");
+  $("#dAbs").textContent = book.abstract || "";
+  const cover = $("#dCover");
+  cover.innerHTML = book.cover
+    ? `<img src="${esc(book.cover)}" onerror="this.parentNode.textContent='书'">`
+    : esc((book.name || "书")[0]);
+  $("#dPane").innerHTML = `<div class="empty" style="padding:30px 0;height:auto">正在加载目录…</div>`;
+  setTab("catalog");
+}
+
+function setTab(tab) {
+  state.tab = tab;
+  document.querySelectorAll("#dTabs button").forEach((b) => {
+    b.setAttribute("aria-pressed", String(b.dataset.t === tab));
+  });
+  if (tab === "catalog") renderCatalog();
+  else renderReader();
+}
+
+function renderCatalog() {
+  const pane = $("#dPane");
+  if (!state.chapters.length) {
+    pane.innerHTML = `<div class="empty" style="padding:30px 0;height:auto">没有目录</div>`;
+    return;
+  }
+  const byVol = new Map();
+  state.chapters.forEach((c) => {
+    if (!byVol.has(c.vol)) byVol.set(c.vol, []);
+    byVol.get(c.vol).push(c);
+  });
+  let html = "";
+  let n = 0;
+  for (const [vol, chs] of byVol) {
+    html += `<div class="vol">${esc(vol)} · ${chs.length} 章</div>`;
+    for (const c of chs) {
+      n++;
+      html += `<div class="chap${state.curChapter === c.id ? " cur" : ""}" data-id="${esc(c.id)}"
+                    style="content-visibility:auto;contain-intrinsic-size:auto 32px">
+                 <span style="color:var(--text-3);min-width:34px">${n}</span>
+                 <span>${esc(c.title)}</span>
+                 ${c.pay ? '<span class="lock">🔒</span>' : ""}
+               </div>`;
+    }
+  }
+  pane.innerHTML = html;
+  pane.querySelectorAll(".chap").forEach((el) => {
+    el.addEventListener("click", () => loadChapter(el.dataset.id));
+  });
+}
+
+function renderReader() {
+  const pane = $("#dPane");
+  if (!state.reader) {
+    pane.innerHTML = `<div class="empty" style="padding:30px 0;height:auto">在目录里点一章看正文</div>`;
+    return;
+  }
+  pane.innerHTML = `<div class="reader">${esc(state.reader.text)}</div>`;
+}
+
+/* ---------------- 后端调用 ---------------- */
+async function doSearch() {
+  const kw = $("#kw").value.trim();
+  if (!kw) return toast("先输入书名、作者或书号");
+  if (state.busy) return;
+  state.busy = true;
+  state.kw = kw;
+  state.selected = null;
+  $("#listTitle").textContent = state.mode === "ai" ? "AI 找书" : "搜索结果";
+  $("#listHint").textContent = state.mode === "ai" ? "AI 正在理解你的需求…" : `正在搜索「${kw}」…`;
+  skeleton(6);
+  $("#btnMore").disabled = true;
+  try {
+    const r = await api("search", kw, state.mode);
+    if (r.error) { toast(r.error); $("#listHint").textContent = ""; renderList([]); return; }
+    state.items = r.items || [];
+    state.offset = r.next_offset || 0;
+    state.hasMore = !!r.has_more;
+    $("#listHint").textContent = r.note ? r.note : `${state.items.length} 本`;
+    renderList(state.items);
+    $("#btnMore").disabled = !state.hasMore;
+    $("#btnMore").textContent = state.hasMore ? "加载更多" : "没有更多了";
+    if (state.items.length) selectBook(state.items[0].book_id);
+  } catch (e) {
+    toast("搜索失败：" + e);
+    renderList([]);
+  } finally {
+    state.busy = false;
+  }
+}
+
+async function loadMore() {
+  if (state.busy || !state.hasMore) return;
+  state.busy = true;
+  $("#btnMore").textContent = "加载中…";
+  const r = await api("more", state.kw, state.mode, state.offset);
+  state.busy = false;
+  if (r.error) { toast(r.error); $("#btnMore").textContent = "加载更多"; return; }
+  const prev = state.items.length;
+  state.items = state.items.concat(r.items || []);
+  state.offset = r.next_offset || state.offset;
+  state.hasMore = !!r.has_more;
+  $("#listHint").textContent = `${state.items.length} 本`;
+  renderList(state.items, { keepSelection: true });
+  markSelected();
+  $("#btnMore").disabled = !state.hasMore;
+  $("#btnMore").textContent = state.hasMore ? "加载更多" : "没有更多了";
+  if (r.items?.length) {
+    const el = document.querySelector(`.card[data-i="${prev}"]`);
+    el?.scrollIntoView({ behavior: "smooth", block: "center" });
+  }
+}
+
+async function selectBook(id) {
+  if (!id) return;
+  state.selected = id;
+  markSelected();
+  const book = state.items.find((b) => b.book_id === id) || state.book;
+  if (!book) return;
+  state.book = book;
+  state.chapters = [];
+  state.reader = null;
+  state.curChapter = null;
+  openDetail(book);
+  const r = await api("detail", id);
+  if (r.error) {
+    toast(r.error);
+    $("#dPane").innerHTML = `<div class="empty" style="padding:30px 0;height:auto">${esc(r.error)}</div>`;
+    // 自动跳过打不开的书
+    const idx = state.items.findIndex((b) => b.book_id === id);
+    if (idx >= 0 && idx + 1 < state.items.length && (state._skip = (state._skip || 0) + 1) <= 3) {
+      setTimeout(() => selectBook(state.items[idx + 1].book_id), 400);
+    }
+    return;
+  }
+  state._skip = 0;
+  state.book = { ...book, ...r.book };
+  openDetail(state.book);
+  state.chapters = r.chapters || [];
+  renderCatalog();
+  setStatus(`${state.book.name} · ${state.chapters.length} 章`);
+}
+
+async function loadChapter(cid) {
+  state.curChapter = cid;
+  renderCatalog();
+  setTab("read");
+  $("#dPane").innerHTML = `<div class="empty" style="padding:30px 0;height:auto">正在取正文…</div>`;
+  const r = await api("chapter", cid);
+  if (r.error) {
+    $("#dPane").innerHTML = `<div class="empty" style="padding:30px 0;height:auto">${esc(r.error)}</div>`;
+    return;
+  }
+  state.reader = r;
+  renderReader();
+}
+
+async function doLibrary() {
+  if (state.busy) return;
+  state.busy = true;
+  state.selected = null;
+  $("#listTitle").textContent = "书库结果";
+  $("#listHint").textContent = "加载中…";
+  skeleton(6);
+  const f = collectFilters();
+  const r = await api("library", f, state.page);
+  state.busy = false;
+  if (r.error) { toast(r.error); $("#listHint").textContent = ""; renderList([]); return; }
+  state.items = r.items || [];
+  state.pageTotal = r.page_total || 1;
+  $("#listHint").textContent = `共约 ${r.total} 本`;
+  $("#pageInfo").textContent = `第 ${state.page + 1} / ${state.pageTotal} 页`;
+  $("#btnPrev").disabled = state.page <= 0;
+  $("#btnNext").disabled = state.page >= state.pageTotal - 1;
+  $("#btnMore").disabled = true;
+  renderList(state.items);
+  if (state.items.length) selectBook(state.items[0].book_id);
+}
+
+function collectFilters() {
+  const g = document.querySelector("#segGender [aria-pressed=true]").dataset.v;
+  const s = document.querySelector("#segStatus [aria-pressed=true]").dataset.v;
+  return {
+    gender: Number(g),
+    creation_status: Number(s),
+    category_id: Number($("#selCat").value),
+    word_count: Number($("#selWords").value),
+    sort: Number($("#selSort").value),
+  };
+}
+
+/* ---------------- 下载 ---------------- */
+async function download(all) {
+  if (!state.book) return toast("先选一本书");
+  let ids = null;
+  if (!all) {
+    const sel = [...document.querySelectorAll(".chap.cur")].map((e) => e.dataset.id);
+    if (!sel.length) return toast("在下拉目录里点一章，或用「下载全书」");
+    ids = sel;
+  }
+  document.querySelectorAll("#btnDownload,#btnDownloadSel").forEach((b) => (b.disabled = true));
+  $("#btnStop").disabled = false;
+  setStatus("开始下载…");
+  const r = await api("download", state.book.book_id, ids,
+    $("#threads").value, $("#outPath").textContent);
+  document.querySelectorAll("#btnDownload,#btnDownloadSel").forEach((b) => (b.disabled = false));
+  $("#btnStop").disabled = true;
+  if (r.error) { toast(r.error); setStatus("下载失败"); return; }
+  setStatus(`完成 ${r.ok} 章`);
+  toast(`已保存到 ${r.path}`);
+  $("#prog").style.width = "100%";
+}
+
+setInterval(async () => {
+  try {
+    const p = await api("progress");
+    if (p.download && p.download[1]) {
+      const [cur, total] = p.download;
+      $("#prog").style.width = Math.round((cur / total) * 100) + "%";
+      setStatus(`下载中 ${cur}/${total}`);
+    }
+    if (p.index && p.index[1]) {
+      const [cur, total, written] = p.index;
+      $("#idxBar").style.width = Math.round((cur / total) * 100) + "%";
+      setStatus(`抓索引 ${cur}/${total} 页 · ${written} 本`);
+    }
+    if (p.index_done) {
+      $("#idxCount").textContent = p.index_done;
+      $("#idxBar").style.width = "0";
+    }
+  } catch (e) {}
+}, 600);
+
+/* ---------------- 初始化 ---------------- */
+function bindSeg(id) {
+  document.querySelectorAll(`#${id} button`).forEach((b) => {
+    b.addEventListener("click", () => {
+      document.querySelectorAll(`#${id} button`).forEach((x) => x.setAttribute("aria-pressed", "false"));
+      b.setAttribute("aria-pressed", "true");
+    });
+  });
+}
+
+async function boot() {
+  await waitApi();
+  bindSeg("segGender");
+  bindSeg("segStatus");
+
+  document.querySelectorAll("#modes button").forEach((b) => {
+    b.addEventListener("click", () => {
+      document.querySelectorAll("#modes button").forEach((x) => x.setAttribute("aria-pressed", "false"));
+      b.setAttribute("aria-pressed", "true");
+      state.mode = b.dataset.v;
+      $("#kw").placeholder = state.mode === "ai"
+        ? "用一句话描述想看的故事，例如：无限流闯关、带规则怪谈"
+        : state.mode === "content" ? "输入正文里的一句话或关键词" : "搜索书名、作者，或粘贴书籍链接（回车）";
+    });
+  });
+
+  $("#kw").addEventListener("keydown", (e) => { if (e.key === "Enter") doSearch(); });
+  $("#modes").addEventListener("click", () => {});
+  $("#btnLib").addEventListener("click", doLibrary);
+  $("#btnMore").addEventListener("click", loadMore);
+  $("#btnPrev").addEventListener("click", () => { if (state.page > 0) { state.page--; doLibrary(); } });
+  $("#btnNext").addEventListener("click", () => { if (state.page < state.pageTotal - 1) { state.page++; doLibrary(); } });
+  $("#btnDownload").addEventListener("click", () => download(true));
+  $("#btnDownloadSel").addEventListener("click", () => download(false));
+  $("#btnStop").addEventListener("click", async () => { await api("stop", ); setStatus("正在停止…"); });
+
+  $("#dTabs").addEventListener("click", (e) => {
+    const b = e.target.closest("button");
+    if (b) setTab(b.dataset.t);
+  });
+
+  $("#outPath").addEventListener("click", async () => {
+    const r = await api("pick_dir", );
+    if (r.path) $("#outPath").textContent = r.path;
+  });
+
+  $("#btnTheme").addEventListener("click", () => {
+    const cur = document.documentElement.getAttribute("data-theme") || "dark";
+    const next = cur === "dark" ? "light" : "dark";
+    document.documentElement.setAttribute("data-theme", next);
+    localStorage.setItem("theme", next);
+  });
+  document.documentElement.setAttribute("data-theme", localStorage.getItem("theme") || "dark");
+
+  $("#btnSettings").addEventListener("click", async () => {
+    const cfg = await api("get_ai_config", );
+    $("#aiKey").value = cfg.api_key || "";
+    $("#aiUrl").value = cfg.base_url || "https://api.deepseek.com";
+    $("#aiModel").value = cfg.model || "deepseek-chat";
+    $("#modal").classList.add("open");
+  });
+  $("#aiCancel").addEventListener("click", () => $("#modal").classList.remove("open"));
+  $("#modal").addEventListener("click", (e) => { if (e.target.id === "modal") $("#modal").classList.remove("open"); });
+  $("#aiSave").addEventListener("click", async () => {
+    await api("save_ai_config", $("#aiKey").value.trim(), $("#aiUrl").value.trim(), $("#aiModel").value.trim());
+    $("#modal").classList.remove("open");
+    toast("已保存，切到「AI 找书」试试");
+  });
+
+  $("#btnIndex").addEventListener("click", async () => {
+    $("#btnIndex").disabled = true;
+    setStatus("开始抓取索引…");
+    await api("build_index", );
+    $("#btnIndex").disabled = false;
+  });
+
+  // 分类 / 标签 / 索引数量
+  const meta = await api("meta", );
+  $("#idxCount").textContent = meta.index_count;
+  const cats = meta.categories || {};
+  const cat = $("#selCat"), tag = $("#selTag");
+  (cats["主分类"] || []).forEach((c) => cat.add(new Option(c.name, c.category_id)));
+  ["情节", "角色", "主题"].forEach((label) => {
+    (cats[label] || []).forEach((c) => tag.add(new Option(`${label} · ${c.name}`, c.category_id)));
+  });
+  setStatus("就绪");
+
+  // 调试/截图用：index.html?q=关键词 打开时自动搜索
+  const auto = new URLSearchParams(location.search).get("q") || "";
+  if (auto && !auto.startsWith("__")) {
+    window.__autoSearch = true;
+    $("#kw").value = auto;
+    setTimeout(doSearch, 400);
+  }
+}
+
+boot().catch((e) => { console.error(e); toast("初始化失败：" + e); });
+
+</script>
+</body>
+</html>

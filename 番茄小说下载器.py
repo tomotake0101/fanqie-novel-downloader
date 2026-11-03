@@ -130,7 +130,6 @@ def extract_state(html_text):
 
 # --------------------------------------------------------------- 字体解码
 import sqlite3
-import customtkinter as ctk
 
 # -*- coding: utf-8 -*-
 # 供拼装使用的后端增量（替换 FontDecoder / search_books，新增索引）
@@ -1185,962 +1184,255 @@ SORT_OPTS = [("默认", 0), ("最新", 1), ("字数最多", 2)]
 GENDER_OPTS = [("全部", -1), ("男频", 0), ("女频", 1)]
 
 
-# -*- coding: utf-8 -*-
-"""界面（深色优先、封面卡片、徽章标签）。"""
+# ------------------------------------------------------------ WebView 桥
+import webview  # noqa: E402
 
-C_BG = ("#F6F7F9", "#0E1014")
-C_CARD = ("#FFFFFF", "#16191F")
-C_CARD2 = ("#F7F8FA", "#1D2128")
-C_CARD3 = ("#EFF1F4", "#232833")
-C_LINE = ("#E8EBEF", "#262B34")
-C_TEXT = ("#171A1F", "#E9EBEF")
-C_MUTED = ("#78818F", "#8A93A2")
-C_DIM = ("#9AA2AE", "#6C7583")
-C_PRIMARY = ("#FF5A1F", "#FF6B35")
-C_PRIMARY_H = ("#FF7A45", "#FF8352")
-C_SOFT = ("#FFF0E8", "#2A1E18")
-C_SOFT_H = ("#FFE2D4", "#3A2820")
-C_SEL = ("#FFF4EE", "#221A15")
-C_GREEN = ("#12A150", "#2ECC71")
-C_BLUE = ("#2A6FDB", "#5B9CFF")
-
-UI_FONT = "Microsoft YaHei UI"
-COVER_DIR = CACHE_DIR / "covers"
+_stop_flag = threading.Event()
+_book_cache = {}
+_dl_running = threading.Event()
 
 
-def ftc(size=11, bold=False):
-    return ctk.CTkFont(family=UI_FONT, size=size, weight="bold" if bold else "normal")
-
-
-# ---------------------------------------------------------------- 封面
-def _rounded(im, radius=10):
-    from PIL import Image, ImageDraw
-    mask = Image.new("L", im.size, 0)
-    ImageDraw.Draw(mask).rounded_rectangle([0, 0, im.size[0] - 1, im.size[1] - 1], radius, fill=255)
-    out = Image.new("RGBA", im.size, (0, 0, 0, 0))
-    out.paste(im, (0, 0), mask)
+def _chapters_flat(info):
+    out = []
+    for vol in info.get("volumes", []):
+        for ch in vol["chapters"]:
+            out.append({"id": ch["id"], "title": ch.get("title", ""),
+                        "pay": ch.get("pay", 0), "vol": vol["name"]})
     return out
 
 
-def load_cover(url, size=(52, 70)):
-    """下载并缓存封面，返回 RGBA 圆角图；失败返回 None。"""
-    if not url:
-        return None
-    # 官方搜索返回的 p*-tt.bytecdn.cn 带防盗链（403），换到可直连的域名
-    url = re.sub(r"https?://p\d+-tt\.bytecdn\.cn", "https://p3-novel.byteimg.com", url)
-    try:
-        from PIL import Image
-        import io
-        COVER_DIR.mkdir(parents=True, exist_ok=True)
-        key = hashlib.md5(url.encode("utf-8")).hexdigest()
-        path = COVER_DIR / f"{key}.png"
-        if not path.exists():
-            raw = Http.get(url, binary=True, timeout=15, retries=1)
-            im = Image.open(io.BytesIO(raw)).convert("RGB")
-            im = im.resize(size, Image.LANCZOS)
-            _rounded(im, 8).save(path)
-        return Image.open(path).convert("RGBA")
-    except Exception:
-        return None
+def _fix_cover(url):
+    """官方封面域名 p*-tt.bytecdn.cn 有防盗链，换成可直连的域名。"""
+    u = str(url or "")
+    return re.sub(r"https?://p\d+-tt\.bytecdn\.cn", "https://p3-novel.byteimg.com", u)
 
 
-class BookCards(ctk.CTkScrollableFrame):
-    """书籍卡片列表（带封面、徽章）。"""
+def _fix_covers(items):
+    for b in items or []:
+        if b.get("cover"):
+            b["cover"] = _fix_cover(b["cover"])
+    return items
 
-    def __init__(self, master, on_select=None, on_cover=None):
-        super().__init__(master, fg_color="transparent", corner_radius=0)
-        self.on_select = on_select
-        self.on_cover = on_cover
-        self.items = []
-        self.selected = None
-        self._cards = []
-        self._covers = {}
-        self.empty = ctk.CTkLabel(self, text="输入书名或作者开始搜索", font=ftc(11),
-                                  text_color=C_MUTED)
-        self.empty.pack(pady=60)
 
-    def _wire(self, widget, idx):
-        widget.bind("<Button-1>", lambda e, i=idx: self._click(i))
-        for ch in widget.winfo_children():
-            self._wire(ch, idx)
+class Api:
+    """暴露给前端的接口（js_api）"""
 
-    def _click(self, idx):
-        self.selected = idx
-        self._paint()
-        if self.on_select:
-            self.on_select(self.items[idx])
+    def __init__(self):
+        self.window = None
 
-    def _paint(self):
-        for i, card in enumerate(self._cards):
-            sel = i == self.selected
-            card.configure(fg_color=C_SEL if sel else C_CARD,
-                           border_color=C_PRIMARY if sel else C_LINE)
-
-    def set_items(self, items, empty_text="没有找到书"):
-        for c in self._cards:
-            c.destroy()
-        self._cards = []
-        self._covers = {}
-        self.items = items or []
-        self.selected = None
-        self.empty.configure(text=empty_text)
-        self.empty.pack(pady=60)
-        if not self.items:
-            return
-        self.empty.pack_forget()
-        for i, b in enumerate(self.items):
-            self._cards.append(self._make_card(i, b))
-        self._paint()
-
-    def _make_card(self, i, b):
-        card = ctk.CTkFrame(self, fg_color=C_CARD, corner_radius=12,
-                            border_width=1, border_color=C_LINE)
-        card.pack(fill="x", pady=(0, 7), padx=2)
-        row = ctk.CTkFrame(card, fg_color="transparent")
-        row.pack(fill="x", padx=10, pady=9)
-
-        # 封面（先放占位）
-        cover = ctk.CTkFrame(row, width=52, height=70, corner_radius=8, fg_color=C_CARD3)
-        cover.pack(side="left", padx=(0, 11))
-        cover.pack_propagate(False)
-        ctk.CTkLabel(cover, text=(b.get("name") or "?")[:1], font=ftc(17, True),
-                     text_color=C_DIM).place(relx=0.5, rely=0.5, anchor="center")
-
-        body = ctk.CTkFrame(row, fg_color="transparent")
-        body.pack(side="left", fill="both", expand=True)
-
-        top = ctk.CTkFrame(body, fg_color="transparent")
-        top.pack(fill="x")
-        ctk.CTkLabel(top, text=(b.get("name") or "未知书名")[:26], font=ftc(12, True),
-                     text_color=C_TEXT, anchor="w").pack(side="left")
-        status = b.get("status") or ""
-        if status:
-            badge = ctk.CTkLabel(top, text=status, font=ftc(8),
-                                 text_color=C_GREEN if status == "完结" else C_BLUE,
-                                 fg_color=C_CARD3, corner_radius=6, width=34, height=18)
-            badge.pack(side="left", padx=(8, 0))
-
-        meta = "  ·  ".join(x for x in [
-            (b.get("author") or "未知作者")[:14],
-            (f"{b['words'] / 10000:.1f} 万字" if b.get("words") else ""),
-        ] if x)
-        ctk.CTkLabel(body, text=meta, font=ftc(9), text_color=C_MUTED, anchor="w").pack(fill="x")
-
-        abstract = (b.get("abstract") or "").replace("\n", " ").strip()
-        if abstract:
-            ctk.CTkLabel(body, text=abstract[:60] + ("…" if len(abstract) > 60 else ""),
-                         font=ftc(9), text_color=C_DIM, anchor="w").pack(fill="x")
-
-        cat = b.get("category") or ""
-        if cat:
-            chip = ctk.CTkLabel(body, text="  " + cat + "  ", font=ftc(8),
-                                text_color=C_PRIMARY, fg_color=C_SOFT, corner_radius=6, height=18)
-            chip.pack(anchor="w", pady=(3, 0))
-
-        self._wire(card, i)
-        if self.on_cover:
-            self.on_cover(i, b.get("cover") or "", cover)
-        return card
-
-    def set_cover(self, i, image):
-        """主线程回调：替换占位为封面图。"""
-        if i >= len(self._cards):
-            return
+    # ---------- 搜索 ----------
+    def search(self, kw, mode="book"):
         try:
-            card = self._cards[i]
-            row = card.winfo_children()[0]
-            holder = row.winfo_children()[0]
-            for ch in holder.winfo_children():
-                ch.destroy()
-            cimg = ctk.CTkImage(light_image=image, dark_image=image, size=(52, 70))
-            lbl = ctk.CTkLabel(holder, text="", image=cimg)
-            lbl.pack(fill="both", expand=True)
-            self._covers[i] = cimg
-            self._wire(card, i)
-        except Exception:
-            pass
+            meta = {}
+            if mode == "ai":
+                items, note = ai_search(kw, limit=40, log=lambda s: print(s))
+                return {"items": _fix_covers(items), "has_more": False, "next_offset": 0, "note": note}
+            items = search_books(kw, mode=mode, limit=60, meta=meta, log=lambda s: print(s))
+            return {"items": _fix_covers(items), "has_more": bool(meta.get("has_more")),
+                    "next_offset": meta.get("next_offset", len(items))}
+        except Exception as e:
+            return {"error": str(e)}
 
-
-class App:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("番茄小说下载器")
-        self.root.geometry("1440x900")
-        self.root.minsize(1200, 780)
-
-        self.books = []
-        self.book = None
-        self.chapters = []
-        self.ui_q = queue.Queue()
-        self.busy = False
-        self.stop_flag = False
-        self.page = 0
-        self.page_total = 1
-        self.mode = "书名/作者"
-        self.cats = {}
-        self.main_opts = [("全部", -1)]
-        self.tag_opts = [("全部", -1)]
-        self._auto_skip = 0
-        self.search_kw = ""
-        self.search_offset = 0
-        self.search_has_more = False
-
-        ctk.set_appearance_mode("light")
-        self._build()
-        self.root.after(70, self._pump)
-        self.bg(self._boot)
-
-    # ---------------- 结构 ----------------
-    def _build(self):
-        self.root.grid_columnconfigure(0, weight=1)
-        self.root.grid_rowconfigure(1, weight=1)
-        self._build_top()
-        self._build_body()
-        self._build_bottom()
-
-    def _build_top(self):
-        bar = ctk.CTkFrame(self.root, fg_color=C_CARD, corner_radius=16, height=76)
-        bar.grid(row=0, column=0, sticky="ew", padx=18, pady=(16, 0))
-        bar.grid_propagate(False)
-        bar.grid_columnconfigure(3, weight=1)
-
-        left = ctk.CTkFrame(bar, fg_color="transparent")
-        left.grid(row=0, column=0, padx=(20, 18), pady=14, sticky="w")
-        ctk.CTkLabel(left, text="番茄小说下载器", font=ftc(18, True),
-                     text_color=C_TEXT).pack(anchor="w")
-        ctk.CTkLabel(left, text="免费章节 · 搜索 · 预览 · 导出 TXT", font=ftc(9),
-                     text_color=C_MUTED).pack(anchor="w")
-
-        self.seg_mode = ctk.CTkSegmentedButton(
-            bar, values=["书名/作者", "正文关键词", "AI 找书"], command=self._switch_mode,
-            font=ftc(10), height=34, corner_radius=9,
-            selected_color=C_PRIMARY, selected_hover_color=C_PRIMARY_H,
-            fg_color=C_CARD2, text_color=C_TEXT, unselected_color=C_CARD2)
-        self.seg_mode.set("书名/作者")
-        self.seg_mode.grid(row=0, column=1, padx=(0, 12))
-
-        self.entry_kw = ctk.CTkEntry(bar, placeholder_text="搜索书名、作者，或粘贴书籍链接 / 书号",
-                                     height=40, corner_radius=20, font=ftc(11),
-                                     fg_color=C_CARD2, border_color=C_LINE, border_width=1,
-                                     text_color=C_TEXT)
-        self.entry_kw.grid(row=0, column=3, sticky="ew", padx=(0, 12))
-        self.entry_kw.bind("<Return>", lambda e: self.do_search())
-
-        self.btn_search = ctk.CTkButton(bar, text="搜 索", width=96, height=40, corner_radius=20,
-                                        font=ftc(11, True), fg_color=C_PRIMARY,
-                                        hover_color=C_PRIMARY_H, command=self.do_search)
-        self.btn_search.grid(row=0, column=4, padx=(0, 14))
-
-        self.sw_dark = ctk.CTkSwitch(bar, text="", width=44, command=self._toggle_theme,
-                                     progress_color=C_PRIMARY, fg_color=C_CARD3)
-        self.sw_dark.grid(row=0, column=5, padx=(0, 10))
-        self.btn_ai = ctk.CTkButton(bar, text="⚙", width=38, height=38, corner_radius=19,
-                                    font=ftc(14), fg_color=C_CARD2, hover_color=C_SOFT,
-                                    text_color=C_MUTED, command=self.open_ai_settings)
-        self.btn_ai.grid(row=0, column=6, padx=(0, 18))
-
-    def _build_body(self):
-        body = ctk.CTkFrame(self.root, fg_color="transparent")
-        body.grid(row=1, column=0, sticky="nsew", padx=18, pady=14)
-        body.grid_columnconfigure(1, weight=1)
-        body.grid_rowconfigure(0, weight=1)
-        self._build_left(body)
-        self._build_center(body)
-        self._build_right(body)
-
-    def _build_left(self, master):
-        panel = ctk.CTkFrame(master, fg_color=C_CARD, corner_radius=16, width=252)
-        panel.grid(row=0, column=0, sticky="nsw", padx=(0, 14))
-        panel.grid_propagate(False)
-        panel.grid_rowconfigure(0, weight=1)
-        panel.grid_columnconfigure(0, weight=1)
-
-        box = ctk.CTkScrollableFrame(panel, fg_color="transparent", corner_radius=0)
-        box.grid(row=0, column=0, sticky="nsew", padx=2, pady=(2, 0))
-
-        ctk.CTkLabel(box, text="按标签找书", font=ftc(12, True), text_color=C_TEXT,
-                     anchor="w").pack(fill="x", padx=16, pady=(12, 0))
-        ctk.CTkLabel(box, text="番茄书库实时筛选", font=ftc(9), text_color=C_MUTED,
-                     anchor="w").pack(fill="x", padx=16, pady=(0, 4))
-
-        def section(t):
-            ctk.CTkLabel(box, text=t, font=ftc(9), text_color=C_DIM,
-                         anchor="w").pack(fill="x", padx=16, pady=(9, 3))
-
-        def dropdown(values, default="全部"):
-            m = ctk.CTkOptionMenu(box, values=values, font=ftc(10), height=30, corner_radius=8,
-                                  fg_color=C_CARD2, button_color=C_CARD2,
-                                  button_hover_color=C_SOFT, text_color=C_TEXT,
-                                  dropdown_fg_color=C_CARD, dropdown_text_color=C_TEXT,
-                                  dropdown_hover_color=C_SOFT)
-            m.set(default)
-            m.pack(fill="x", padx=16)
-            return m
-
-        section("频道")
-        self.opt_gender = dropdown(["全部", "男频", "女频"])
-        section("分类")
-        self.opt_cat = dropdown(["全部"])
-        section("标签")
-        self.opt_tag = dropdown(["全部"])
-        section("状态")
-        self.opt_status = dropdown(["全部", "完结", "连载"])
-        section("字数")
-        self.opt_words = dropdown([n for n, _ in WORD_TIERS])
-        section("排序")
-        self.opt_sort = dropdown([n for n, _ in SORT_OPTS])
-
-        self.btn_lib = ctk.CTkButton(box, text="查询书库", height=34, corner_radius=9,
-                                     font=ftc(10, True), fg_color=C_SOFT, hover_color=C_SOFT_H,
-                                     text_color=C_PRIMARY, command=self.do_library)
-        self.btn_lib.pack(fill="x", padx=16, pady=(14, 14))
-
-        idx = ctk.CTkFrame(panel, fg_color="transparent")
-        idx.grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 14))
-        ctk.CTkFrame(idx, height=1, fg_color=C_LINE).pack(fill="x", pady=(0, 10))
-        ctk.CTkLabel(idx, text="本地索引", font=ftc(11, True), text_color=C_TEXT,
-                     anchor="w").pack(fill="x")
-        ctk.CTkLabel(idx, text="离线书库快照", font=ftc(9), text_color=C_MUTED,
-                     anchor="w").pack(fill="x", pady=(0, 5))
-        self.lbl_index = ctk.CTkLabel(idx, text="0 本", font=ftc(10, True),
-                                      text_color=C_TEXT, anchor="w")
-        self.lbl_index.pack(fill="x")
-        self.pb_index = ctk.CTkProgressBar(idx, height=5, corner_radius=3,
-                                           progress_color=C_PRIMARY, fg_color=C_CARD3)
-        self.pb_index.set(0)
-        self.pb_index.pack(fill="x", pady=6)
-        self.btn_index = ctk.CTkButton(idx, text="更新索引", height=30, corner_radius=8,
-                                       font=ftc(9), fg_color=C_CARD2, hover_color=C_SOFT,
-                                       text_color=C_TEXT, command=self.do_index)
-        self.btn_index.pack(fill="x")
-
-    def _build_center(self, master):
-        panel = ctk.CTkFrame(master, fg_color=C_CARD, corner_radius=16)
-        panel.grid(row=0, column=1, sticky="nsew")
-        panel.grid_rowconfigure(1, weight=1)
-        panel.grid_columnconfigure(0, weight=1)
-
-        head = ctk.CTkFrame(panel, fg_color="transparent")
-        head.grid(row=0, column=0, sticky="ew", padx=18, pady=(14, 6))
-        self.lbl_list_title = ctk.CTkLabel(head, text="搜索结果", font=ftc(13, True),
-                                           text_color=C_TEXT)
-        self.lbl_list_title.pack(side="left")
-        self.lbl_hint = ctk.CTkLabel(head, text="", font=ftc(9), text_color=C_DIM)
-        self.lbl_hint.pack(side="left", padx=10)
-
-        self.cards = BookCards(panel, on_select=self.pick_book, on_cover=self._hook_cover)
-        self.cards.grid(row=1, column=0, sticky="nsew", padx=14)
-
-        pager = ctk.CTkFrame(panel, fg_color="transparent")
-        pager.grid(row=2, column=0, sticky="ew", padx=18, pady=(6, 14))
-        self.btn_prev = ctk.CTkButton(pager, text="上一页", width=74, height=28, corner_radius=8,
-                                      font=ftc(9), fg_color=C_CARD2, hover_color=C_SOFT,
-                                      text_color=C_MUTED, command=lambda: self.turn_page(-1))
-        self.btn_prev.pack(side="left")
-        self.lbl_page = ctk.CTkLabel(pager, text="第 1 页", font=ftc(9), text_color=C_DIM)
-        self.lbl_page.pack(side="left", padx=10)
-        self.btn_next = ctk.CTkButton(pager, text="下一页", width=74, height=28, corner_radius=8,
-                                      font=ftc(9), fg_color=C_CARD2, hover_color=C_SOFT,
-                                      text_color=C_MUTED, command=lambda: self.turn_page(1))
-        self.btn_next.pack(side="left")
-        self.btn_more = ctk.CTkButton(pager, text="加载更多", width=88, height=28, corner_radius=8,
-                                      font=ftc(9), fg_color=C_SOFT, hover_color=C_SOFT_H,
-                                      text_color=C_PRIMARY, command=self.load_more)
-        self.btn_more.pack(side="left", padx=(14, 0))
-        self.btn_more.configure(state="disabled")
-
-    def _build_right(self, master):
-        panel = ctk.CTkFrame(master, fg_color=C_CARD, corner_radius=16, width=440)
-        panel.grid(row=0, column=2, sticky="nsew", padx=(14, 0))
-        panel.grid_propagate(False)
-
-        info = ctk.CTkFrame(panel, fg_color="transparent")
-        info.pack(fill="x", padx=18, pady=(16, 0))
-
-        self.cover_big = ctk.CTkFrame(info, width=78, height=104, corner_radius=10, fg_color=C_CARD3)
-        self.cover_big.pack(side="left", padx=(0, 14))
-        self.cover_big.pack_propagate(False)
-        self.lbl_cover_ph = ctk.CTkLabel(self.cover_big, text="", font=ftc(20, True),
-                                         text_color=C_DIM)
-        self.lbl_cover_ph.place(relx=0.5, rely=0.5, anchor="center")
-
-        meta = ctk.CTkFrame(info, fg_color="transparent")
-        meta.pack(side="left", fill="both", expand=True)
-        self.lbl_book = ctk.CTkLabel(meta, text="未选择书籍", font=ftc(14, True),
-                                     text_color=C_TEXT, anchor="w", wraplength=300, justify="left")
-        self.lbl_book.pack(fill="x")
-        self.lbl_book_meta = ctk.CTkLabel(meta, text="从左侧列表选一本书", font=ftc(9),
-                                          text_color=C_MUTED, anchor="w", justify="left",
-                                          wraplength=300)
-        self.lbl_book_meta.pack(fill="x", pady=(2, 0))
-
-        self.lbl_abstract = ctk.CTkLabel(panel, text="", font=ftc(9), text_color=C_DIM,
-                                         anchor="w", justify="left", wraplength=390)
-        self.lbl_abstract.pack(fill="x", padx=18, pady=(8, 0))
-
-        ctk.CTkLabel(panel, text="章节目录", font=ftc(9, True), text_color=C_TEXT,
-                     anchor="w").pack(fill="x", padx=18, pady=(12, 4))
-
-        tree_wrap = tk.Frame(panel, bg="#16191F", highlightthickness=0)
-        tree_wrap.pack(fill="both", expand=True, padx=16)
-        self.tree = ttk.Treeview(tree_wrap, columns=("t",), show="tree", style="Fanqie.Treeview")
-        self.tree.column("#0", width=380, minwidth=200, stretch=True)
-        sb = ttk.Scrollbar(tree_wrap, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=sb.set)
-        self.tree.pack(side="left", fill="both", expand=True)
-        sb.pack(side="right", fill="y")
-        self.tree.bind("<Double-1>", lambda e: self.preview_selected())
-        self._style_tree()
-
-        head2 = ctk.CTkFrame(panel, fg_color="transparent")
-        head2.pack(fill="x", padx=18, pady=(10, 4))
-        ctk.CTkLabel(head2, text="正文预览", font=ftc(9, True), text_color=C_TEXT).pack(side="left")
-        self.lbl_ptitle = ctk.CTkLabel(head2, text="", font=ftc(9), text_color=C_PRIMARY)
-        self.lbl_ptitle.pack(side="left", padx=8)
-
-        text_wrap = ctk.CTkFrame(panel, fg_color=C_CARD2, corner_radius=10)
-        text_wrap.pack(fill="both", expand=True, padx=16, pady=(0, 16))
-        self.txt = tk.Text(text_wrap, wrap="word", bd=0, relief="flat", bg="#FAFBFC",
-                           fg="#2A2F36", insertbackground="#2A2F36", font=(UI_FONT, 10),
-                           padx=14, pady=12, spacing1=3, spacing3=5, height=8,
-                           selectbackground="#FFE2D4")
-        tsb = ttk.Scrollbar(text_wrap, orient="vertical", command=self.txt.yview)
-        self.txt.configure(yscrollcommand=tsb.set)
-        self.txt.pack(side="left", fill="both", expand=True, padx=(2, 0), pady=2)
-        tsb.pack(side="right", fill="y")
-
-    def _style_tree(self):
-        dark = bool(self.sw_dark.get()) if hasattr(self, "sw_dark") else False
-        bg = "#16191F" if dark else "#FFFFFF"
-        fg = "#D6DAE0" if dark else "#1A1D21"
-        sel = "#2A1E18" if dark else "#FFF3EC"
-        st = ttk.Style()
-        st.configure("Fanqie.Treeview", background=bg, fieldbackground=bg, foreground=fg,
-                     rowheight=28, borderwidth=0, font=(UI_FONT, 9))
-        st.configure("Fanqie.Treeview.Heading", background=bg, foreground="#8A93A2",
-                     relief="flat", font=(UI_FONT, 9))
-        st.map("Fanqie.Treeview", background=[("selected", sel)],
-               foreground=[("selected", "#FFB08A" if dark else "#E2540F")])
-        st.configure("Vertical.TScrollbar", background="#2A2F38" if dark else "#DDE0E4",
-                     troughcolor=bg, borderwidth=0, arrowsize=10)
-
-    def _build_bottom(self):
-        bar = ctk.CTkFrame(self.root, fg_color=C_CARD, corner_radius=16)
-        bar.grid(row=2, column=0, sticky="ew", padx=18, pady=(0, 16))
-        bar.grid_columnconfigure(1, weight=1)
-
-        ctk.CTkLabel(bar, text="保存到", font=ftc(9), text_color=C_MUTED).grid(
-            row=0, column=0, padx=(18, 8), pady=(12, 4), sticky="w")
-        self.var_dir = tk.StringVar(value=str(Path.home() / "Downloads" / "番茄小说"))
-        ctk.CTkEntry(bar, textvariable=self.var_dir, height=32, corner_radius=8, font=ftc(10),
-                     fg_color=C_CARD2, border_color=C_LINE, text_color=C_TEXT).grid(
-            row=0, column=1, columnspan=2, sticky="ew", pady=(12, 4))
-        ctk.CTkButton(bar, text="浏览", width=62, height=32, corner_radius=8, font=ftc(10),
-                      fg_color=C_CARD2, hover_color=C_SOFT, text_color=C_TEXT,
-                      command=self.pick_dir).grid(row=0, column=3, padx=8, pady=(12, 4))
-
-        ctk.CTkLabel(bar, text="线程", font=ftc(9), text_color=C_MUTED).grid(
-            row=0, column=4, padx=(4, 6), pady=(12, 4))
-        self.var_th = tk.IntVar(value=8)
-        ctk.CTkEntry(bar, textvariable=self.var_th, width=50, height=32, corner_radius=8,
-                     font=ftc(10), fg_color=C_CARD2, border_color=C_LINE, text_color=C_TEXT).grid(
-            row=0, column=5, padx=(0, 12), pady=(12, 4))
-
-        self.btn_dl_all = ctk.CTkButton(bar, text="下载全书", width=104, height=32, corner_radius=8,
-                                        font=ftc(10, True), fg_color=C_PRIMARY,
-                                        hover_color=C_PRIMARY_H,
-                                        command=lambda: self.start_download(False))
-        self.btn_dl_all.grid(row=0, column=6, padx=(0, 8), pady=(12, 4))
-        self.btn_dl_sel = ctk.CTkButton(bar, text="下载选中", width=94, height=32, corner_radius=8,
-                                        font=ftc(10), fg_color=C_SOFT, hover_color=C_SOFT_H,
-                                        text_color=C_PRIMARY,
-                                        command=lambda: self.start_download(True))
-        self.btn_dl_sel.grid(row=0, column=7, padx=(0, 8), pady=(12, 4))
-        self.btn_stop = ctk.CTkButton(bar, text="停止", width=62, height=32, corner_radius=8,
-                                      font=ftc(10), fg_color=C_CARD2, hover_color=C_SOFT,
-                                      text_color=C_MUTED, command=self.stop_download)
-        self.btn_stop.grid(row=0, column=8, padx=(0, 18), pady=(12, 4))
-
-        self.pb = ctk.CTkProgressBar(bar, height=6, corner_radius=3, progress_color=C_PRIMARY,
-                                     fg_color=C_CARD3)
-        self.pb.grid(row=1, column=0, columnspan=9, sticky="ew", padx=18, pady=(0, 4))
-        self.pb.set(0)
-        self.lbl_status = ctk.CTkLabel(bar, text="就绪", font=ftc(9), text_color=C_MUTED, anchor="w")
-        self.lbl_status.grid(row=2, column=0, columnspan=9, sticky="ew", padx=18, pady=(0, 10))
-
-    # ---------------- 主题 ----------------
-    def _toggle_theme(self):
-        dark = bool(self.sw_dark.get())
-        ctk.set_appearance_mode("dark" if dark else "light")
-        bg = "#1B1F26" if dark else "#FBFBFC"
-        fg = "#D6DAE0" if dark else "#171A1F"
-        self.txt.configure(bg=bg, fg=fg, insertbackground=fg)
-        for w in (getattr(self, "tree", None),):
-            if w is not None:
-                self.root.after(50, self._refresh_tree_style)
-
-    def _refresh_tree_style(self):
-        self._style_tree()
-
-    # ---------------- 队列 ----------------
-    def log(self, msg):
-        self.ui_q.put(("status", msg))
-
-    def status(self, msg):
-        self.ui_q.put(("status", msg))
-
-    def _pump(self):
+    def more(self, kw, mode="book", offset=0):
         try:
-            while True:
-                kind, payload = self.ui_q.get_nowait()
-                if kind == "status":
-                    self.lbl_status.configure(text=payload)
-                elif kind == "progress":
-                    cur, total = payload
-                    self.pb.set(min(1.0, cur / max(1, total)))
-                    self.lbl_status.configure(text=f"下载中 {cur}/{total} 章（{cur * 100 // max(1, total)}%）")
-                elif kind == "index_progress":
-                    cur, total, written = payload
-                    self.pb.set(min(1.0, cur / max(1, total)))
-                    self.lbl_status.configure(text=f"抓取索引 {cur}/{total} 页，已写入 {written} 本")
-                elif kind == "index_count":
-                    self.lbl_index.configure(text=f"{payload} 本")
-                    self.pb.set(0)
-                elif kind == "books":
-                    items, title, hint = payload
-                    self.books = items
-                    self.lbl_list_title.configure(text=title)
-                    self.lbl_hint.configure(text=hint)
-                    self.cards.set_items(items)
-                    if items:
-                        self.cards.selected = 0
-                        self.cards._paint()
-                        self.pick_book(items[0])
-                elif kind == "chapters":
-                    self.fill_chapters(payload)
-                elif kind == "preview":
-                    self.txt.delete("1.0", "end")
-                    self.txt.insert("1.0", payload[1])
-                    self.lbl_ptitle.configure(text=payload[0])
-                elif kind == "busy":
-                    self._set_busy(payload)
-                elif kind == "page":
-                    self.lbl_page.configure(text=f"第 {self.page + 1} / {max(1, self.page_total)} 页")
-                elif kind == "append_books":
-                    more, has_more = payload
-                    if more:
-                        prev = self.cards.selected
-                        self.books = self.books + more
-                        self.cards.set_items(self.books)
-                        if prev is not None and prev < len(self.books):
-                            self.cards.selected = prev
-                            self.cards._paint()
-                        self.lbl_hint.configure(text=f"{len(self.books)} 本")
-                    self.btn_more.configure(text="加载更多" if has_more else "没有更多了",
-                                            state="normal" if has_more else "disabled")
-                elif kind == "more_state":
-                    self.btn_more.configure(text="加载更多" if payload else "没有更多了",
-                                            state="normal" if payload else "disabled")
-                elif kind == "cover":
-                    idx, img = payload
-                    self.cards.set_cover(idx, img)
-                elif kind == "cover_big":
-                    img = payload
-                    try:
-                        for ch in self.cover_big.winfo_children():
-                            ch.destroy()
-                        cimg = ctk.CTkImage(light_image=img, dark_image=img, size=(78, 104))
-                        self._cover_big_ref = cimg
-                        ctk.CTkLabel(self.cover_big, text="", image=cimg).pack(fill="both", expand=True)
-                    except Exception:
-                        pass
-                elif kind == "done":
-                    messagebox.showinfo("完成", payload)
-                    self._set_busy(False)
-        except queue.Empty:
-            pass
-        self.root.after(70, self._pump)
+            meta = {}
+            items = search_books(kw, mode=mode, limit=30, offset=int(offset or 0), meta=meta)
+            return {"items": _fix_covers(items), "has_more": bool(meta.get("has_more")),
+                    "next_offset": meta.get("next_offset", 0)}
+        except Exception as e:
+            return {"error": str(e)}
 
-    def _set_busy(self, flag):
-        self.busy = flag
-        state = "disabled" if flag else "normal"
-        for b in (self.btn_dl_all, self.btn_dl_sel, self.btn_search, self.btn_lib,
-                  self.btn_index):
-            b.configure(state=state)
-        self.btn_stop.configure(state="normal" if flag else "disabled")
+    # ---------- 书库 ----------
+    def library(self, filters, page=0):
+        try:
+            rows, total = library_list(page_index=int(page or 0), **(filters or {}))
+            items = hydrate_books([r["book_id"] for r in rows])
+            return {"items": _fix_covers(items), "total": total,
+                    "page_total": max(1, min(556, (total + 17) // 18))}
+        except Exception as e:
+            return {"error": str(e)}
 
-    def bg(self, fn, *a, **kw):
-        def runner():
-            try:
-                fn(*a, **kw)
-            except Exception as e:
-                self.ui_q.put(("status", f"出错：{e}"))
-                self.ui_q.put(("busy", False))
-                if os.environ.get("FANQIE_DEBUG"):
-                    traceback.print_exc()
-        threading.Thread(target=runner, daemon=True).start()
-
-    # ---------------- 数据 ----------------
-    def _boot(self):
-        self.ui_q.put(("index_count", index_count()))
+    def meta(self):
         try:
             cats = library_categories()
         except Exception as e:
-            self.ui_q.put(("status", f"标签加载失败：{e}"))
-            return
-        self.ui_q.put(("cats", cats))
+            print("[meta] 分类失败:", e, flush=True)
+            cats = {}
+        n = index_count()
+        print(f"[meta] index_count={n} 分类组={list(cats.keys())}", flush=True)
+        return {"index_count": n, "categories": cats}
 
-    def _fill_cats(self, cats):
-        self.cats = cats
-        mains = cats.get("主分类", [])
-        self.main_opts = [("全部", -1)] + [(c["name"], c["category_id"]) for c in mains]
-        self.opt_cat.configure(values=[n for n, _ in self.main_opts])
-        self.opt_cat.set("全部")
-        tags = []
-        for label in ("情节", "角色", "主题"):
-            for c in cats.get(label, []):
-                tags.append((f"{label}·{c['name']}", c["category_id"]))
-        self.tag_opts = [("全部", -1)] + tags
-        self.opt_tag.configure(values=[n for n, _ in self.tag_opts])
-        self.opt_tag.set("全部")
-
-    def _hook_cover(self, idx, url, holder):
-        """卡片创建时触发异步封面下载。"""
-        if not url:
-            return
-
-        def load():
-            img = load_cover(url, (52, 70))
-            if img is not None:
-                self.ui_q.put(("cover", (idx, img)))
-
-        threading.Thread(target=load, daemon=True).start()
-
-    # ---------------- 动作 ----------------
-    def _switch_mode(self, value):
-        self.mode = value
-
-    def _current_filter(self):
-        gender = {"全部": -1, "男频": 0, "女频": 1}[self.opt_gender.get()]
-        status = {"全部": -1, "完结": 0, "连载": 1}[self.opt_status.get()]
-        cat = -1
-        for n, v in self.main_opts:
-            if n == self.opt_cat.get():
-                cat = v
-                break
-        if cat == -1:
-            for n, v in self.tag_opts:
-                if n == self.opt_tag.get():
-                    cat = v
-                    break
-        words = -1
-        for n, v in WORD_TIERS:
-            if n == self.opt_words.get():
-                words = v
-        sort = 0
-        for n, v in SORT_OPTS:
-            if n == self.opt_sort.get():
-                sort = v
-        return {"gender": gender, "category_id": cat, "creation_status": status,
-                "word_count": words, "sort": sort}
-
-    def do_search(self):
-        kw = self.entry_kw.get().strip()
-        if not kw:
-            self.status("先输入书名、作者或书号")
-            return
-        if self.busy:
-            return
-        self._set_busy(True)
-        self.lbl_list_title.configure(text="搜索结果")
-        self.lbl_hint.configure(text=f"正在搜索「{kw}」…")
-        mode = {"书名/作者": "book", "正文关键词": "content", "AI 找书": "ai"}.get(self.mode, "book")
-        self.bg(self._search_worker, kw, mode)
-
-    def _search_worker(self, kw, mode):
-        meta = {}
+    # ---------- 详情 / 章节 ----------
+    def detail(self, book_id):
         try:
-            if mode == "ai":
-                items, note = ai_search(kw, limit=40, log=self.log)
-                self.search_kw = ""
-                self.search_has_more = False
-                self.ui_q.put(("books", (items, "AI 找书", note or "")))
-                self.ui_q.put(("more_state", False))
-                return
-            items = search_books(kw, mode=mode, limit=60, log=self.log, meta=meta)
-            self.search_kw = kw
-            self.search_offset = meta.get("next_offset", len(items))
-            self.search_has_more = bool(meta.get("has_more"))
-            hint = f"{len(items)} 本" if items else "没找到，换个关键词或贴书籍链接"
-            self.ui_q.put(("books", (items, "搜索结果", hint)))
-            self.ui_q.put(("more_state", self.search_has_more))
-        finally:
-            self.ui_q.put(("busy", False))
-
-    def load_more(self):
-        if self.busy or not self.search_kw or not self.search_has_more:
-            return
-        self._set_busy(True)
-        self.btn_more.configure(text="加载中…")
-        self.bg(self._more_worker)
-
-    def _more_worker(self):
-        meta = {}
-        try:
-            more = search_books(self.search_kw, limit=30, offset=self.search_offset,
-                                log=self.log, meta=meta)
-            self.search_offset = meta.get("next_offset", self.search_offset + len(more))
-            self.search_has_more = bool(meta.get("has_more"))
-            self.ui_q.put(("append_books", (more, self.search_has_more)))
-        finally:
-            self.ui_q.put(("busy", False))
-
-    def do_library(self):
-        if self.busy:
-            return
-        self.page = 0
-        self._set_busy(True)
-        self._run_library()
-
-    def _run_library(self):
-        self.search_kw = ""
-        self.btn_more.configure(text="加载更多", state="disabled")
-        self.lbl_hint.configure(text="加载中…")
-        self.bg(self._library_worker, self._current_filter(), self.page)
-
-    def _library_worker(self, f, page):
-        try:
-            rows, total = library_list(page_index=page, **f)
-            items = hydrate_books([r["book_id"] for r in rows])
-            self.page_total = min(556, max(1, (total + 17) // 18))
-            self.ui_q.put(("books", (items, "书库结果", f"共约 {total} 本")))
-            self.ui_q.put(("page", None))
-        finally:
-            self.ui_q.put(("busy", False))
-
-    def turn_page(self, delta):
-        if self.busy:
-            return
-        new = self.page + delta
-        if new < 0 or new >= self.page_total:
-            return
-        self.page = new
-        self._set_busy(True)
-        self._run_library()
-
-    def do_index(self):
-        if self.busy:
-            return
-        self._set_busy(True)
-        self.lbl_status.configure(text="开始抓取索引…")
-        self.bg(self._index_worker)
-
-    def _index_worker(self):
-        try:
-            build_index(progress=lambda c, t, w: self.ui_q.put(("index_progress", (c, t, w))),
-                        should_stop=lambda: self.stop_flag, log=self.log)
-            self.ui_q.put(("index_count", index_count()))
-            self.ui_q.put(("status", f"索引完成，共 {index_count()} 本"))
-        finally:
-            self.ui_q.put(("busy", False))
-
-    def pick_book(self, book):
-        self.book = book
-        self.lbl_book.configure(text=book.get("name") or "未选择书籍")
-        meta = "  ·  ".join(x for x in [
-            book.get("author"), (f"{book['words'] / 10000:.1f} 万字" if book.get("words") else ""),
-            book.get("status")] if x)
-        self.lbl_book_meta.configure(text=meta or "作者未知")
-        self.lbl_abstract.configure(text=(book.get("abstract") or "")[:110])
-        try:
-            self.lbl_cover_ph.configure(text=(book.get("name") or "?")[:1])
+            info = book_detail(book_id, with_chapters=True)
+            _book_cache[book_id] = info
+            book = {k: info[k] for k in ("book_id", "name", "author", "status",
+                                         "words", "abstract", "cover") if k in info}
+            book["cover"] = _fix_cover(book.get("cover"))
+            return {"book": book, "chapters": _chapters_flat(info)}
         except Exception:
-            pass
-        for ch in self.cover_big.winfo_children():
-            if ch is not self.lbl_cover_ph:
-                ch.destroy()
-        url = book.get("cover") or ""
-        if url:
-            threading.Thread(target=self._load_big_cover, args=(url,), daemon=True).start()
-        self.bg(self._chapters_worker, book)
+            return {"error": "这本书打不开（可能已下架或仅 App 可读）"}
 
-    def _load_big_cover(self, url):
-        img = load_cover(url, (78, 104))
-        if img is not None:
-            self.ui_q.put(("cover_big", img))
-
-    def _chapters_worker(self, book):
+    def chapter(self, item_id):
         try:
-            info = book_detail(book["book_id"], with_chapters=True)
-            self._auto_skip = 0
-            self.ui_q.put(("chapters", info))
-        except Exception:
-            name = book.get("name") or "这本书"
-            idx = self.cards.selected
-            self._auto_skip = getattr(self, "_auto_skip", 0) + 1
-            if idx is not None and idx + 1 < len(self.books) and self._auto_skip <= 3:
-                self.ui_q.put(("status", f"《{name}》打不开（已下架或仅 App 可读），自动换下一本…"))
-                self.root.after(200, lambda: self.cards._click(idx + 1))
-            else:
-                self.ui_q.put(("status", f"《{name}》打不开，换一本或直接贴书籍链接"))
+            info = chapter_text(item_id)
+            return {"title": info["title"], "text": info["text"], "words": info["words"]}
+        except Exception as e:
+            return {"error": f"正文取不到：{e}"}
 
-    def fill_chapters(self, info):
-        self.book = info
-        self.chapters = []
-        self.tree.delete(*self.tree.get_children())
-        n = 0
-        for vi, vol in enumerate(info["volumes"]):
-            node = self.tree.insert("", "end", text=f"  {vol['name']}（{len(vol['chapters'])}章）",
-                                    open=(vi == 0))
-            for ch in vol["chapters"]:
-                n += 1
-                self.tree.insert(node, "end", iid=ch["id"],
-                                 text=f"   {n}. {ch['title']}" + ("   🔒" if ch.get("pay") else ""))
-                self.chapters.append(ch)
-        self.lbl_status.configure(text=f"《{info['name']}》共 {len(self.chapters)} 章")
-
-    def preview_selected(self):
-        sel = self.tree.selection()
-        if not sel or not _ID_RE.match(sel[0]):
-            self.status("先选中一章（不是卷名）")
-            return
-        item_id = sel[0]
-        title = self.tree.item(item_id, "text").strip()
-        self.lbl_status.configure(text=f"正在取正文：{title}")
-        self.bg(self._preview_worker, item_id, title)
-
-    def _preview_worker(self, item_id, title):
-        info = chapter_text(item_id)
-        self.ui_q.put(("preview", (f"{info['title'] or title}　{info['words']}字", info["text"])))
-        self.ui_q.put(("status", "预览完成"))
-
-    def open_ai_settings(self):
-        cfg = ai_config()
-        win = ctk.CTkToplevel(self.root)
-        win.title("AI 设置")
-        win.geometry("500x330")
-        win.transient(self.root)
-        win.grab_set()
-        ctk.CTkLabel(win, text="AI 找书需要 DeepSeek API Key", font=ftc(13, True),
-                     text_color=C_TEXT).pack(anchor="w", padx=22, pady=(20, 4))
-        ctk.CTkLabel(win, text="Key 只保存在本机 .cache/ai.json，不会上传到任何地方",
-                     font=ftc(9), text_color=C_MUTED).pack(anchor="w", padx=22)
-        ctk.CTkLabel(win, text="API Key", font=ftc(9), text_color=C_DIM).pack(anchor="w", padx=22, pady=(14, 3))
-        e_key = ctk.CTkEntry(win, show="*", height=34, corner_radius=8, font=ftc(10),
-                             fg_color=C_CARD2, border_color=C_LINE, text_color=C_TEXT)
-        e_key.pack(fill="x", padx=22)
-        e_key.insert(0, cfg.get("api_key") or "")
-        ctk.CTkLabel(win, text="接口地址", font=ftc(9), text_color=C_DIM).pack(anchor="w", padx=22, pady=(10, 3))
-        e_url = ctk.CTkEntry(win, height=30, corner_radius=8, font=ftc(10),
-                             fg_color=C_CARD2, border_color=C_LINE, text_color=C_TEXT)
-        e_url.pack(fill="x", padx=22)
-        e_url.insert(0, cfg.get("base_url") or AI_DEFAULTS["base_url"])
-        ctk.CTkLabel(win, text="模型", font=ftc(9), text_color=C_DIM).pack(anchor="w", padx=22, pady=(10, 3))
-        e_model = ctk.CTkEntry(win, height=30, corner_radius=8, font=ftc(10),
-                               fg_color=C_CARD2, border_color=C_LINE, text_color=C_TEXT)
-        e_model.pack(fill="x", padx=22)
-        e_model.insert(0, cfg.get("model") or AI_DEFAULTS["model"])
-
-        def save():
-            ok = ai_save_config({"api_key": e_key.get().strip(),
-                                 "base_url": e_url.get().strip(),
-                                 "model": e_model.get().strip()})
-            win.destroy()
-            self.lbl_status.configure(text="AI 设置已保存，切到「AI 找书」用一句话描述就行" if ok else "保存失败")
-
-        ctk.CTkButton(win, text="保存", height=38, corner_radius=9, fg_color=C_PRIMARY,
-                      hover_color=C_PRIMARY_H, font=ftc(11, True), command=save).pack(
-            fill="x", padx=22, pady=20)
-
-    def pick_dir(self):
-        d = filedialog.askdirectory(initialdir=self.var_dir.get() or str(Path.home()))
-        if d:
-            self.var_dir.set(d)
-
-    # ---------------- 下载 ----------------
-    def start_download(self, selected_only):
-        if not self.book:
-            messagebox.showwarning("提示", "先点一本书，加载它的目录")
-            return
-        if self.busy:
-            return
-        if selected_only:
-            sel = [i for i in self.tree.selection() if _ID_RE.match(i)]
-            chapters = [c for c in self.chapters if c["id"] in set(sel)]
-            if not chapters:
-                messagebox.showwarning("提示", "没选中章节（Ctrl 可多选）")
-                return
-        else:
-            chapters = list(self.chapters)
+    # ---------- 下载 ----------
+    def download(self, book_id, ids=None, threads=8, out_dir=None):
+        info = _book_cache.get(book_id)
+        if not info:
+            try:
+                info = book_detail(book_id, with_chapters=True)
+                _book_cache[book_id] = info
+            except Exception as e:
+                return {"error": str(e)}
+        chapters = [c for c in _chapters_flat(info)]
+        if ids:
+            wanted = set(ids)
+            chapters = [c for c in chapters if c["id"] in wanted]
         if not chapters:
-            return
-        self.stop_flag = False
-        self._set_busy(True)
-        out_dir = self.var_dir.get()
-        try:
-            threads = max(1, int(self.var_th.get()))
-        except Exception:
-            threads = 8
-        self.lbl_status.configure(text=f"开始下载，共 {len(chapters)} 章…")
-        self.bg(self._download_worker, self.book, chapters, out_dir, threads)
+            return {"error": "没有可下载的章节"}
+        out_dir = out_dir or str(Path.home() / "Downloads" / "番茄小说")
+        _stop_flag.clear()
+        _dl_running.set()
 
-    def _download_worker(self, book, chapters, out_dir, threads):
+        def on_progress(cur, total):
+            _progress["download"] = [cur, total]
+
         try:
             out, ok, failed = download_book(
-                book, chapters, out_dir, threads=threads, on_log=self.log,
-                on_progress=lambda c, t: self.ui_q.put(("progress", (c, t))),
-                should_stop=lambda: self.stop_flag)
-            msg = f"完成：{ok}/{len(chapters)} 章\n已保存到：{out}"
-            if failed:
-                msg += f"\n失败 {len(failed)} 章（可重试）"
-            self.ui_q.put(("status", "下载完成"))
-            self.ui_q.put(("done", msg))
+                info, chapters, out_dir, threads=max(1, int(threads or 8)),
+                on_log=lambda s: print(s), on_progress=on_progress,
+                should_stop=lambda: _stop_flag.is_set())
+            return {"ok": ok, "path": str(out), "failed": len(failed)}
         except Exception as e:
-            self.ui_q.put(("status", f"下载失败：{e}"))
-            self.ui_q.put(("busy", False))
+            return {"error": str(e)}
+        finally:
+            _dl_running.clear()
 
-    def stop_download(self):
-        self.stop_flag = True
-        self.lbl_status.configure(text="正在停止（已下载的保留）…")
+    def progress(self):
+        return dict(_progress)
+
+    def stop(self):
+        _stop_flag.set()
+        return {"ok": True}
+
+    # ---------- 杂项 ----------
+    def pick_dir(self):
+        try:
+            res = self.window.create_file_dialog(webview.FOLDER_DIALOG)
+            if res:
+                return {"path": res[0] if isinstance(res, (list, tuple)) else res}
+        except Exception:
+            pass
+        return {"path": str(Path.home() / "Downloads" / "番茄小说")}
+
+    def get_ai_config(self):
+        cfg = ai_config()
+        cfg = dict(cfg)
+        cfg["api_key"] = cfg.get("api_key") or ""
+        return cfg
+
+    def save_ai_config(self, key, base_url, model):
+        ai_save_config({"api_key": key or "", "base_url": base_url or "https://api.deepseek.com",
+                        "model": model or "deepseek-chat"})
+        return {"ok": True}
+
+    def build_index(self):
+        def run():
+            try:
+                build_index(
+                    progress=lambda c, t, w: _progress.__setitem__("index", [c, t, w]),
+                    should_stop=lambda: _stop_flag.is_set(), log=lambda s: print(s))
+            except Exception as e:
+                print("索引失败", e)
+            finally:
+                _progress["index_done"] = index_count()
+
+        threading.Thread(target=run, daemon=True).start()
+        return {"started": True}
 
 
-WORD_TIERS = [("全部", -1), ("30万以下", 0), ("30-50万", 1), ("50-100万", 2),
-              ("100-200万", 3), ("200万以上", 4)]
-SORT_OPTS = [("默认", 0), ("最新", 1), ("字数最多", 2)]
+# --------------------------------------------------------- 本地 HTTP 服务
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler  # noqa: E402
+import socketserver  # noqa: E402
+
+_progress = {"download": [0, 0], "index": [0, 0, 0], "index_done": 0}
+
+
+class _Handler(BaseHTTPRequestHandler):
+    api = None
+    ui_file = None
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *args):
+        pass
+
+    def _json(self, obj, code=200):
+        body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        path = self.path.split("?")[0]
+        if path in ("/", "/index.html"):
+            data = self.ui_file.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        elif path == "/api/progress":
+            self._json(_progress)
+        else:
+            self._json({"error": "not found"}, 404)
+
+    def do_POST(self):
+        path = self.path.split("?")[0]
+        if not path.startswith("/api/"):
+            return self._json({"error": "not found"}, 404)
+        name = path[5:]
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            args = json.loads(self.rfile.read(length) or b"[]") if length else []
+            fn = getattr(self.api, name, None)
+            if not callable(fn):
+                return self._json({"error": f"未知接口 {name}"}, 400)
+            result = fn(*args)
+            self._json(result if isinstance(result, dict) else {"ok": True, "data": result})
+        except Exception as e:
+            self._json({"error": str(e)}, 500)
+
+
+def start_server(api):
+    _Handler.api = api
+    _Handler.ui_file = APP_DIR / "ui" / "index.html"
+    httpd = ThreadingHTTPServer(("127.0.0.1", 8731), _Handler)
+    port = httpd.server_address[1]
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    return httpd, port
 
 
 def run_gui():
-    ctk.set_appearance_mode("light")
-    ctk.set_default_color_theme("blue")
-    root = ctk.CTk()
-    App(root)
-    root.mainloop()
-
-
-# ------------------------------------------------------------------ 自测
-def selftest(keyword="十日终焉"):
-    print("== 1) 本地索引 ==")
-    print("   当前索引:", index_count(), "本")
-    if index_count() == 0:
-        print("   首次建索引（书库接口若被限流会自动停下）…")
-        t0 = time.time()
-        build_index(log=print)
-        print(f"   用时 {time.time()-t0:.1f}s，索引 {index_count()} 本")
-
-    print("\n== 2) 搜索 ==")
-    for kw in (keyword, "土豆", "恐怖"):
-        items = search_books(kw, log=lambda s: None)
-        print(f"   「{kw}」→ {len(items)} 本：{[b['name'] for b in items[:3]]}")
-
-    info = book_detail("7143038691944959011", with_chapters=True)
-    print(f"\n== 3) 《{info['name']}》{info['total']} 章 ==")
-    got = chapter_text(info["volumes"][0]["chapters"][0]["id"])
-    print("   ", got["title"], got["words"], "字")
-    print("   ", got["text"][:100].replace("\n", " "))
-    out, ok, failed = download_book(info, info["volumes"][0]["chapters"][:2],
-                                    OUT_DIR, threads=4, on_log=print)
-    print(f"   写出 {out}（{ok} 章，失败 {len(failed)}）")
-    return 0
+    api = Api()
+    httpd, port = start_server(api)
+    window = webview.create_window(
+        "番茄小说下载器", url=f"http://127.0.0.1:{port}/", js_api=api,
+        width=1380, height=880, min_size=(1120, 720),
+        background_color="#0A0B10", text_select=True,
+    )
+    api.window = window
+    try:
+        webview.start(debug=False)
+    finally:
+        httpd.shutdown()
 
 
 if __name__ == "__main__":
