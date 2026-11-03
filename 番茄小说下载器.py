@@ -686,6 +686,144 @@ def search_books(keyword, mode="book", limit=60, log=None, auto_index=True, offs
     return items
 
 
+# ------------------------------------------------------------- AI 找书
+AI_FILE = CACHE_DIR / "ai.json"
+AI_DEFAULTS = {"base_url": "https://api.deepseek.com", "model": "deepseek-chat", "api_key": ""}
+
+
+def ai_config():
+    cfg = dict(AI_DEFAULTS)
+    try:
+        if AI_FILE.exists():
+            cfg.update(json.loads(AI_FILE.read_text(encoding="utf-8")))
+    except Exception:
+        pass
+    if os.environ.get("DEEPSEEK_API_KEY"):
+        cfg["api_key"] = os.environ["DEEPSEEK_API_KEY"]
+    return cfg
+
+
+def ai_save_config(cfg):
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        AI_FILE.write_text(json.dumps(cfg, ensure_ascii=False, indent=1), encoding="utf-8")
+        return True
+    except Exception:
+        return False
+
+
+def ai_ready():
+    return bool((ai_config().get("api_key") or "").strip())
+
+
+def ai_chat(messages, temperature=0.3, json_mode=False, timeout=90):
+    """调用 DeepSeek（OpenAI 兼容）接口。"""
+    cfg = ai_config()
+    key = (cfg.get("api_key") or "").strip()
+    if not key:
+        raise RuntimeError("还没配置 DeepSeek API Key，点右上角 ⚙ 填一下")
+    body = {"model": cfg.get("model") or "deepseek-chat", "messages": messages,
+            "temperature": temperature, "stream": False}
+    if json_mode:
+        body["response_format"] = {"type": "json_object"}
+    url = (cfg.get("base_url") or AI_DEFAULTS["base_url"]).rstrip("/") + "/chat/completions"
+    req = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"), headers={
+        "Content-Type": "application/json", "Authorization": "Bearer " + key})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = json.loads(r.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")[:200]
+        if e.code == 401:
+            raise RuntimeError("DeepSeek API Key 无效，请重新填写")
+        raise RuntimeError(f"AI 接口返回 {e.code}：{detail}")
+    except Exception as e:
+        raise RuntimeError(f"AI 接口连接失败：{e}")
+    return (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
+
+
+def _json_of(text, fallback=None):
+    text = (text or "").strip()
+    m = re.search(r"\{.*\}", text, re.S)
+    if m:
+        text = m.group(0)
+    try:
+        return json.loads(text)
+    except Exception:
+        return fallback if fallback is not None else {}
+
+
+def ai_search(query, limit=40, log=None):
+    """自然语言找书：AI 拆关键词 → 官方搜索 → AI 按简介精排。"""
+    query = (query or "").strip()
+    if not query:
+        raise RuntimeError("先用一句话描述你想看的故事")
+
+    if log:
+        log("[AI] 正在理解你的需求…")
+    plan = _json_of(ai_chat([
+        {"role": "system", "content": "你是网文检索助手。只输出 JSON。"},
+        {"role": "user", "content":
+            f"读者需求：{query}\n\n"
+            "请输出 JSON：{\"keywords\":[3到5个用于站内搜索的关键词，2到6个字，覆盖题材/设定/主角特点],"
+            "\"note\":\"一句话概括你理解的需求\"}。关键词要具体，不要用‘小说’这种泛词。"},
+    ], temperature=0.2, json_mode=True))
+
+    keywords = [str(k).strip() for k in (plan.get("keywords") or []) if str(k).strip()][:5]
+    if not keywords:
+        keywords = [query]
+    note = plan.get("note") or query
+    if log:
+        log(f"[AI] 关键词：{'、'.join(keywords)}")
+
+    pool, seen = [], set()
+    for kw in keywords:
+        try:
+            for b in official_search(kw, limit=30):
+                if b["book_id"] not in seen:
+                    seen.add(b["book_id"])
+                    pool.append(b)
+        except Exception as e:
+            if log:
+                log(f"[AI] 关键词「{kw}」检索失败：{e}")
+    if not pool:
+        return [], note
+
+    if log:
+        log(f"[AI] 候选 {len(pool)} 本，正在按简介精排…")
+    brief = "\n".join(
+        f'{i}. {b["name"]}｜{b.get("author")}｜{(b.get("abstract") or "")[:90]}'
+        for i, b in enumerate(pool[:90]))
+    ranked = _json_of(ai_chat([
+        {"role": "system", "content": "你是网文编辑，只输出 JSON。"},
+        {"role": "user", "content":
+            f"读者需求：{query}\n\n候选书单：\n{brief}\n\n"
+            "挑出最符合的，按契合度从高到低排序，最多 30 本。"
+            "只输出 JSON：{\"picks\":[{\"i\":序号,\"why\":\"10字内理由\"}]}"},
+    ], temperature=0.2, json_mode=True))
+
+    picks = ranked.get("picks") or []
+    out, used = [], set()
+    for item in picks:
+        try:
+            idx = int(item.get("i"))
+        except Exception:
+            continue
+        if idx < 0 or idx >= len(pool) or idx in used:
+            continue
+        used.add(idx)
+        book = dict(pool[idx])
+        book["why"] = (item.get("why") or "")[:24]
+        out.append(book)
+        if len(out) >= limit:
+            break
+    if not out:
+        out = pool[:limit]
+    if log:
+        log(f"[AI] 选出 {len(out)} 本")
+    return out, note
+
+
 LIB_API = "https://fanqienovel.com/api/author/library/book_list/v0/"
 CAT_API = "https://fanqienovel.com/api/author/book/category_list/v0/"
 CAT_FILE = ASSET_DIR / "categories.json"
@@ -1274,7 +1412,7 @@ class App:
                      text_color=C_MUTED).pack(anchor="w")
 
         self.seg_mode = ctk.CTkSegmentedButton(
-            bar, values=["书名/作者", "正文关键词"], command=self._switch_mode,
+            bar, values=["书名/作者", "正文关键词", "AI 找书"], command=self._switch_mode,
             font=ftc(10), height=34, corner_radius=9,
             selected_color=C_PRIMARY, selected_hover_color=C_PRIMARY_H,
             fg_color=C_CARD2, text_color=C_TEXT, unselected_color=C_CARD2)
@@ -1295,7 +1433,11 @@ class App:
 
         self.sw_dark = ctk.CTkSwitch(bar, text="", width=44, command=self._toggle_theme,
                                      progress_color=C_PRIMARY, fg_color=C_CARD3)
-        self.sw_dark.grid(row=0, column=5, padx=(0, 18))
+        self.sw_dark.grid(row=0, column=5, padx=(0, 10))
+        self.btn_ai = ctk.CTkButton(bar, text="⚙", width=38, height=38, corner_radius=19,
+                                    font=ftc(14), fg_color=C_CARD2, hover_color=C_SOFT,
+                                    text_color=C_MUTED, command=self.open_ai_settings)
+        self.btn_ai.grid(row=0, column=6, padx=(0, 18))
 
     def _build_body(self):
         body = ctk.CTkFrame(self.root, fg_color="transparent")
@@ -1712,12 +1854,19 @@ class App:
         self._set_busy(True)
         self.lbl_list_title.configure(text="搜索结果")
         self.lbl_hint.configure(text=f"正在搜索「{kw}」…")
-        mode = "content" if self.mode == "正文关键词" else "book"
+        mode = {"书名/作者": "book", "正文关键词": "content", "AI 找书": "ai"}.get(self.mode, "book")
         self.bg(self._search_worker, kw, mode)
 
     def _search_worker(self, kw, mode):
         meta = {}
         try:
+            if mode == "ai":
+                items, note = ai_search(kw, limit=40, log=self.log)
+                self.search_kw = ""
+                self.search_has_more = False
+                self.ui_q.put(("books", (items, "AI 找书", note or "")))
+                self.ui_q.put(("more_state", False))
+                return
             items = search_books(kw, mode=mode, limit=60, log=self.log, meta=meta)
             self.search_kw = kw
             self.search_offset = meta.get("next_offset", len(items))
@@ -1864,6 +2013,44 @@ class App:
         info = chapter_text(item_id)
         self.ui_q.put(("preview", (f"{info['title'] or title}　{info['words']}字", info["text"])))
         self.ui_q.put(("status", "预览完成"))
+
+    def open_ai_settings(self):
+        cfg = ai_config()
+        win = ctk.CTkToplevel(self.root)
+        win.title("AI 设置")
+        win.geometry("500x330")
+        win.transient(self.root)
+        win.grab_set()
+        ctk.CTkLabel(win, text="AI 找书需要 DeepSeek API Key", font=ftc(13, True),
+                     text_color=C_TEXT).pack(anchor="w", padx=22, pady=(20, 4))
+        ctk.CTkLabel(win, text="Key 只保存在本机 .cache/ai.json，不会上传到任何地方",
+                     font=ftc(9), text_color=C_MUTED).pack(anchor="w", padx=22)
+        ctk.CTkLabel(win, text="API Key", font=ftc(9), text_color=C_DIM).pack(anchor="w", padx=22, pady=(14, 3))
+        e_key = ctk.CTkEntry(win, show="*", height=34, corner_radius=8, font=ftc(10),
+                             fg_color=C_CARD2, border_color=C_LINE, text_color=C_TEXT)
+        e_key.pack(fill="x", padx=22)
+        e_key.insert(0, cfg.get("api_key") or "")
+        ctk.CTkLabel(win, text="接口地址", font=ftc(9), text_color=C_DIM).pack(anchor="w", padx=22, pady=(10, 3))
+        e_url = ctk.CTkEntry(win, height=30, corner_radius=8, font=ftc(10),
+                             fg_color=C_CARD2, border_color=C_LINE, text_color=C_TEXT)
+        e_url.pack(fill="x", padx=22)
+        e_url.insert(0, cfg.get("base_url") or AI_DEFAULTS["base_url"])
+        ctk.CTkLabel(win, text="模型", font=ftc(9), text_color=C_DIM).pack(anchor="w", padx=22, pady=(10, 3))
+        e_model = ctk.CTkEntry(win, height=30, corner_radius=8, font=ftc(10),
+                               fg_color=C_CARD2, border_color=C_LINE, text_color=C_TEXT)
+        e_model.pack(fill="x", padx=22)
+        e_model.insert(0, cfg.get("model") or AI_DEFAULTS["model"])
+
+        def save():
+            ok = ai_save_config({"api_key": e_key.get().strip(),
+                                 "base_url": e_url.get().strip(),
+                                 "model": e_model.get().strip()})
+            win.destroy()
+            self.lbl_status.configure(text="AI 设置已保存，切到「AI 找书」用一句话描述就行" if ok else "保存失败")
+
+        ctk.CTkButton(win, text="保存", height=38, corner_radius=9, fg_color=C_PRIMARY,
+                      hover_color=C_PRIMARY_H, font=ftc(11, True), command=save).pack(
+            fill="x", padx=22, pady=20)
 
     def pick_dir(self):
         d = filedialog.askdirectory(initialdir=self.var_dir.get() or str(Path.home()))

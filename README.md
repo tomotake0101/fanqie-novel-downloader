@@ -9,10 +9,18 @@
 ## 功能
 
 - **搜索**：调番茄官方轻量搜索接口，**不需要签名**，一次返回 60 本，可点「加载更多」继续翻（官方接口支持 offset 翻页）
+- **AI 找书**：用一句话描述想看的故事（「无限流闯关、带规则怪谈」），AI 拆成关键词去搜，再按简介精排，给出理由
 - **按标签找书**：频道、36 个主分类、224 个细分标签（情节/角色/主题）、状态、字数、排序、翻页
 - **预览**：双击章节看正文，保留段落缩进，图片位置标 `[图片]`
 - **下载**：并发抓取，输出单个 txt（简介 + 分卷 + 全部章节），支持中断续传
 - **本地索引**：把番茄书库书单抓到本地 SQLite，搜索/离线兜底
+
+## AI 找书（可选）
+
+点右上角 ⚙ 填 DeepSeek API Key（只保存在本机 `.cache/ai.json`），然后把顶部模式切到「AI 找书」。
+
+流程：AI 把描述拆成 3–5 个搜索关键词 → 官方接口检索出上百本候选 → AI 读简介挑出最贴合的并排序。
+Key 也可以直接用环境变量 `DEEPSEEK_API_KEY` 注入。
 
 ## 安装
 
@@ -42,6 +50,7 @@ python 番茄小说下载器.py
 | 环节 | 做法 |
 | --- | --- |
 | 搜索 | `novel.snssdk.com/api/novel/channel/homepage/search/search/v1/`（官方免签名接口，`aid=1967&q=&offset=`） |
+| AI 找书 | DeepSeek `chat/completions`（JSON 模式）：先拆关键词，再对候选书单按简介精排 |
 | 目录 | `/api/reader/directory/detail?bookId=` |
 | 书籍信息 | 书籍页 `window.__INITIAL_STATE__.page`（明文） |
 | 正文 | 章节页 `reader.chapterData.content` |
