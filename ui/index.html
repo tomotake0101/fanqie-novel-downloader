@@ -154,6 +154,7 @@ select:focus{border-color:var(--accent)}
   display:flex;gap:12px;padding:11px;border-radius:var(--r-lg);
   border:1px solid transparent;cursor:pointer;position:relative;
   transform:translateY(0);
+  content-visibility:auto;contain-intrinsic-size:auto 94px;
   transition:background .15s ease,border-color .15s ease,transform .18s var(--ease-out);
   animation:cardIn .32s var(--ease-out) both;
 }
@@ -521,7 +522,7 @@ function renderList(items, { keepSelection = false } = {}) {
     const cat = b.category ? `<span class="chip">${esc(b.category)}</span>` : "";
     const why = b.why ? `<span class="why">${esc(b.why)}</span>` : "";
     const cover = b.cover
-      ? `<img src="${esc(b.cover)}" loading="lazy" onerror="this.style.display='none'">`
+      ? `<img src="${esc(b.cover)}" loading="lazy" decoding="async" onerror="this.style.display='none'">`
       : esc((b.name || "?")[0]);
     return `
       <div class="card${sel ? " sel" : ""}" data-id="${esc(b.book_id)}" data-i="${i}"
@@ -582,6 +583,10 @@ function setTab(tab) {
 
 function renderCatalog() {
   const pane = $("#dPane");
+  if (state.loadingDetail) {
+    pane.innerHTML = `<div class="empty" style="padding:30px 0;height:auto">正在加载目录…</div>`;
+    return;
+  }
   if (!state.chapters.length) {
     pane.innerHTML = `<div class="empty" style="padding:30px 0;height:auto">没有目录</div>`;
     return;
@@ -675,6 +680,7 @@ async function loadMore() {
 
 async function selectBook(id) {
   if (!id) return;
+  const token = (state._selToken = (state._selToken || 0) + 1);
   state.selected = id;
   markSelected();
   const book = state.items.find((b) => b.book_id === id) || state.book;
@@ -683,8 +689,11 @@ async function selectBook(id) {
   state.chapters = [];
   state.reader = null;
   state.curChapter = null;
+  state.loadingDetail = true;
   openDetail(book);
   const r = await api("detail", id);
+  if (token !== state._selToken) return;   // 用户已经点了别的书，这次结果丢掉
+  state.loadingDetail = false;
   if (r.error) {
     toast(r.error);
     $("#dPane").innerHTML = `<div class="empty" style="padding:30px 0;height:auto">${esc(r.error)}</div>`;
@@ -697,8 +706,8 @@ async function selectBook(id) {
   }
   state._skip = 0;
   state.book = { ...book, ...r.book };
+  state.chapters = r.chapters || [];   // 先放好目录，再刷新详情，避免闪一下"没有目录"
   openDetail(state.book);
-  state.chapters = r.chapters || [];
   renderCatalog();
   setStatus(`${state.book.name} · ${state.chapters.length} 章`);
 }
@@ -763,35 +772,72 @@ async function download(all) {
   document.querySelectorAll("#btnDownload,#btnDownloadSel").forEach((b) => (b.disabled = true));
   $("#btnStop").disabled = false;
   setStatus("开始下载…");
+  startPoll();
   const r = await api("download", state.book.book_id, ids,
     $("#threads").value, $("#outPath").textContent);
   document.querySelectorAll("#btnDownload,#btnDownloadSel").forEach((b) => (b.disabled = false));
   $("#btnStop").disabled = true;
+  syncIdleState();
   if (r.error) { toast(r.error); setStatus("下载失败"); return; }
   setStatus(`完成 ${r.ok} 章`);
   toast(`已保存到 ${r.path}`);
   $("#prog").style.width = "100%";
 }
 
-setInterval(async () => {
+/** 一轮任务结束后，把进度条和轮询都收干净。 */
+function syncIdleState() {
+  const bar = $("#prog");
+  if (bar && bar.style.width && bar.style.width !== "100%") bar.style.width = "0";
+  stopPoll();
+}
+
+/* ---------------- 进度轮询（只在真干活时才开） ---------------- */
+let _pollTimer = null, _pollBusy = false;
+
+function startPoll() {
+  if (_pollTimer) return;
+  _pollTimer = setInterval(pollOnce, 700);
+}
+function stopPoll() {
+  if (_pollTimer) { clearInterval(_pollTimer); _pollTimer = null; }
+}
+async function pollOnce() {
+  if (_pollBusy || document.hidden) return;
+  _pollBusy = true;
+  let stillBusy = false;
   try {
-    const p = await api("progress");
+    const ctrl = new AbortController();
+    const to = setTimeout(() => ctrl.abort(), 4000);
+    const r = await fetch("/api/progress", { cache: "no-store", signal: ctrl.signal });
+    clearTimeout(to);
+    const p = await r.json();
     if (p.download && p.download[1]) {
       const [cur, total] = p.download;
+      stillBusy = true;
       $("#prog").style.width = Math.round((cur / total) * 100) + "%";
       setStatus(`下载中 ${cur}/${total}`);
     }
     if (p.index && p.index[1]) {
       const [cur, total, written] = p.index;
+      stillBusy = true;
       $("#idxBar").style.width = Math.round((cur / total) * 100) + "%";
       setStatus(`抓索引 ${cur}/${total} 页 · ${written} 本`);
     }
     if (p.index_done) {
       $("#idxCount").textContent = p.index_done;
-      $("#idxBar").style.width = "0";
+      if (!p.index || !p.index[1]) $("#idxBar").style.width = "0";
     }
-  } catch (e) {}
-}, 600);
+  } catch (e) {
+    // 后端一时没应答就停 3 秒再试，绝不让请求越堆越多
+    _pollBusy = false;
+    stopPoll();
+    setTimeout(startPoll, 3000);
+    return;
+  } finally {
+    _pollBusy = false;
+  }
+  if (!stillBusy) stopPoll();
+}
 
 /* ---------------- 初始化 ---------------- */
 function bindSeg(id) {
@@ -865,6 +911,7 @@ async function boot() {
   $("#btnIndex").addEventListener("click", async () => {
     $("#btnIndex").disabled = true;
     setStatus("开始抓取索引…");
+    startPoll();
     await api("build_index", );
     $("#btnIndex").disabled = false;
   });
@@ -873,6 +920,7 @@ async function boot() {
   const meta = await api("meta", );
   $("#idxCount").textContent = meta.index_count;
   if (meta.out_dir) { $("#outPath").textContent = meta.out_dir; }
+  if (meta.threads) { $("#threads").value = meta.threads; }
   const cats = meta.categories || {};
   const cat = $("#selCat"), tag = $("#selTag");
   (cats["主分类"] || []).forEach((c) => cat.add(new Option(c.name, c.category_id)));

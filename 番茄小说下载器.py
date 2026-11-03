@@ -558,29 +558,46 @@ SEARCH_API = "https://novel.snssdk.com/api/novel/channel/homepage/search/search/
 
 
 def official_search(keyword, limit=40, offset=0, log=None, meta=None):
-    """番茄官方轻量搜索接口：不需要签名，支持 offset 翻页，能搜全站。"""
+    """番茄官方轻量搜索接口：不需要签名，支持 offset 翻页，能搜全站。
+
+    每页只给 10 条，翻 6 页如果一串请求排队发，就是 6 秒白等；
+    这里把 6 页并发抓下来，通常一秒多就有结果。
+    """
     keyword = (keyword or "").strip()
     if not keyword:
         return []
-    out, seen = [], set()
     if meta is not None:
         meta["has_more"] = False
         meta["next_offset"] = offset
-    while len(out) < limit:
-        params = {"aid": "1967", "q": keyword, "offset": str(offset)}
+
+    def fetch(off):
+        params = {"aid": "1967", "q": keyword, "offset": str(off)}
         url = SEARCH_API + "?" + urllib.parse.urlencode(params)
-        try:
-            payload = json.loads(Http.get(url, referer="https://fanqienovel.com/", timeout=20, retries=2))
-        except Exception as e:
-            if log:
-                log(f"[官方搜索] 请求失败：{e}")
-            break
+        payload = json.loads(Http.get(url, referer="https://fanqienovel.com/", timeout=20, retries=2))
         if payload.get("code") != 0:
-            if log:
-                log(f"[官方搜索] 返回异常 code={payload.get('code')}")
-            break
+            raise RuntimeError(f"code={payload.get('code')}")
         data = payload.get("data") or {}
-        rows = data.get("ret_data") or []
+        return (data.get("ret_data") or [], bool(data.get("has_more")),
+                int(data.get("offset") or (off + 10)))
+
+    pages = max(1, (limit + 9) // 10)
+    got = {}
+    with ThreadPoolExecutor(max_workers=min(4, pages)) as pool:
+        futs = {i: pool.submit(fetch, offset + i * 10) for i in range(pages)}
+        for i in range(pages):
+            try:
+                got[i] = futs[i].result(timeout=40)
+            except Exception as e:
+                if log:
+                    log(f"[官方搜索] 第 {i + 1} 页失败：{e}")
+
+    out, seen = [], set()
+    last_ok = -1
+    for i in range(pages):
+        if i not in got:
+            break
+        last_ok = i
+        rows, more, next_off = got[i]
         for b in rows:
             bid = str(b.get("book_id") or "")
             if not bid or bid in seen:
@@ -596,17 +613,16 @@ def official_search(keyword, limit=40, offset=0, log=None, meta=None):
                 "category": b.get("category") or "",
                 "cover": b.get("thumb_url") or "",
             })
-        next_off = int(data.get("offset") or (offset + 10))
-        more = bool(data.get("has_more"))
-        offset = next_off
         if meta is not None:
             meta["has_more"] = more
             meta["next_offset"] = next_off
         if not rows or not more:
             break
-        time.sleep(0.15)
+    if meta is not None and last_ok + 1 < pages and not out:
+        # 一页都没成：把游标留在原地，用户点"加载更多"还能重试
+        meta["next_offset"] = offset
     if log:
-        log(f"[官方搜索] 命中 {len(out)} 本")
+        log(f"[官方搜索] 命中 {len(out)} 本（并发 {pages} 页）")
     return out[:limit]
 
 
@@ -1202,9 +1218,15 @@ def _chapters_flat(info):
 
 
 def _fix_cover(url):
-    """官方封面域名 p*-tt.bytecdn.cn 有防盗链，换成可直连的域名。"""
+    """封面地址收拾成能直接用的：换掉有防盗链的域名，并让 CDN 只给缩略图尺寸。
+
+    列表里封面只显示 52x70，却拉 640 宽的图（一张 150KB、解码占 1MB 内存），
+    60 本就要 90MB 内存。改成 160 宽：一张 12KB，内存省一个数量级。
+    """
     u = str(url or "")
-    return re.sub(r"https?://p\d+-tt\.bytecdn\.cn", "https://p3-novel.byteimg.com", u)
+    u = re.sub(r"https?://p\d+-tt\.bytecdn\.cn", "https://p3-novel.byteimg.com", u)
+    u = re.sub(r"~tplv-shrink:\d+:", "~tplv-shrink:160:", u)
+    return u
 
 
 def _fix_covers(items):
@@ -1227,6 +1249,12 @@ def default_out_dir():
         except Exception:
             continue
     return str(OUT_DIR)
+
+
+def _default_threads():
+    """默认下载线程数：按核数给，别把 CPU 全占死（界面还要渲染）。"""
+    cores = os.cpu_count() or 2
+    return max(2, min(8, cores * 2))
 
 
 class Api:
@@ -1275,7 +1303,8 @@ class Api:
             cats = {}
         n = index_count()
         print(f"[meta] index_count={n} 分类组={list(cats.keys())}", flush=True)
-        return {"index_count": n, "categories": cats, "out_dir": default_out_dir()}
+        return {"index_count": n, "categories": cats, "out_dir": default_out_dir(),
+                "threads": _default_threads()}
 
     # ---------- 详情 / 章节 ----------
     def detail(self, book_id):
@@ -1380,17 +1409,46 @@ class Api:
         return {"started": True}
 
 
-# --------------------------------------------------------- 本地 HTTP 服务
+# --------------------------------------------------------- 本机 HTTP 服务
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler  # noqa: E402
-import socketserver  # noqa: E402
 
 _progress = {"download": [0, 0], "index": [0, 0, 0], "index_done": 0}
+
+LOG_FILE = CACHE_DIR / "app.log"
+
+
+def _log(msg):
+    """把关键事件写进 .cache/app.log。界面出问题时看这个文件就够了。"""
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"{time.strftime('%m-%d %H:%M:%S')} {msg}\n")
+    except Exception:
+        pass
+
+
+class _Server(ThreadingHTTPServer):
+    """加固过的 HTTP 服务：
+
+    - 队列加大，慢请求不会把连接堆在门外
+    - 出错只记一行日志，绝不走 traceback.print_exc()（它会去读源文件，
+      异常时曾把处理线程卡死，表现就是整个界面失去响应）
+    """
+
+    daemon_threads = True
+    allow_reuse_address = True
+    request_queue_size = 128
+
+    def handle_error(self, request, client_address):
+        etype, evalue, _ = sys.exc_info()
+        _log(f"[http] {getattr(etype, '__name__', etype)}: {evalue} <- {client_address}")
 
 
 class _Handler(BaseHTTPRequestHandler):
     api = None
     ui_file = None
-    protocol_version = "HTTP/1.1"
+    protocol_version = "HTTP/1.0"   # 短连接：一次请求一条连接，线程用完就退，不会越积越多
+    timeout = 20                    # 客户端不发请求就断开，不让线程无限等
 
     def log_message(self, *args):
         pass
@@ -1400,6 +1458,7 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
 
@@ -1410,10 +1469,13 @@ class _Handler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(data)
         elif path == "/api/progress":
             self._json(_progress)
+        elif path == "/api/ping":
+            self._json({"ok": True})
         else:
             self._json({"error": "not found"}, 404)
 
@@ -1422,6 +1484,7 @@ class _Handler(BaseHTTPRequestHandler):
         if not path.startswith("/api/"):
             return self._json({"error": "not found"}, 404)
         name = path[5:]
+        t0 = time.perf_counter()
         try:
             length = int(self.headers.get("Content-Length") or 0)
             args = json.loads(self.rfile.read(length) or b"[]") if length else []
@@ -1431,33 +1494,115 @@ class _Handler(BaseHTTPRequestHandler):
             result = fn(*args)
             self._json(result if isinstance(result, dict) else {"ok": True, "data": result})
         except Exception as e:
+            _log(f"[api] {name} 失败：{type(e).__name__}: {e}")
             self._json({"error": str(e)}, 500)
+        finally:
+            cost = time.perf_counter() - t0
+            if cost > 1.5:
+                _log(f"[api] {name} 用了 {cost:.1f}s")
+
+
+def _serve_forever(httpd):
+    """serve_forever 万一抛异常（例如系统资源耗尽），自动重启，不留下半死的服务。"""
+    while True:
+        try:
+            httpd.serve_forever(poll_interval=0.5)
+            return
+        except Exception as e:
+            _log(f"[http] serve_forever 异常，2 秒后重启：{type(e).__name__}: {e}")
+            setattr(httpd, "_BaseServer__shutdown_request", False)
+            time.sleep(2)
 
 
 def start_server(api):
     _Handler.api = api
     _Handler.ui_file = APP_DIR / "ui" / "index.html"
+    httpd = None
+    for port in (8731, 0):
+        try:
+            httpd = _Server(("127.0.0.1", port), _Handler)
+            break
+        except OSError as e:
+            _log(f"[http] 端口 {port} 打不开（{e}），换随机端口")
+    if httpd is None:
+        raise RuntimeError("本机 HTTP 服务启动失败")
+    threading.Thread(target=_serve_forever, args=(httpd,), daemon=True).start()
+    return httpd, httpd.server_address[1]
+
+
+# WebView2 默认会开一堆子进程；这台机器核少内存紧，把它压到最小：
+# 一个渲染进程、JS 堆上限 64M、不用 GPU 进程（集显还要抢同一份内存）、关掉后台联网。
+WEBVIEW2_ARGS = " ".join([
+    "--disable-gpu",
+    "--renderer-process-limit=1",
+    "--js-flags=--max-old-space-size=64",
+    "--disable-background-networking",
+    "--disable-features=CalculateNativeWinOcclusion,msEdgeMemorySaver",
+    "--disable-extensions",
+    "--disable-sync",
+    "--no-first-run",
+])
+
+
+def _ui_url(port):
+    """界面地址。设了环境变量 FANQIE_DEBUG_Q 就自动搜这个词（截图/自测用）。"""
+    url = f"http://127.0.0.1:{port}/"
+    q = (os.environ.get("FANQIE_DEBUG_Q") or "").strip()
+    if q:
+        url += "?q=" + urllib.parse.quote(q)
+    return url
+
+
+def _screen_size():
+    """屏幕工作区尺寸（像素）。取不到就按 1366x768 算。"""
     try:
-        httpd = ThreadingHTTPServer(("127.0.0.1", 8731), _Handler)
-    except OSError:
-        httpd = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)  # 端口被占就随机
-    port = httpd.server_address[1]
-    threading.Thread(target=httpd.serve_forever, daemon=True).start()
-    return httpd, port
+        import ctypes
+        from ctypes import wintypes
+        rect = wintypes.RECT()
+        if ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(rect), 0):
+            return rect.right - rect.left, rect.bottom - rect.top
+    except Exception:
+        pass
+    return 1366, 768
+
+
+def _already_running(port=8731):
+    """已经有一个实例在跑？（能 ping 通才算，光占着端口不算）"""
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/ping", timeout=1.0) as r:
+            return json.loads(r.read().decode("utf-8")).get("ok") is True
+    except Exception:
+        return False
 
 
 def run_gui():
+    os.environ.setdefault("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", WEBVIEW2_ARGS)
+    _log("======== 启动界面 ========")
+    if _already_running():
+        _log("[app] 已经有实例在运行，本次启动退出")
+        try:
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(
+                None, "番茄小说下载器已经在运行了，去任务栏找一下它。",
+                "番茄小说下载器", 0x40)
+        except Exception:
+            pass
+        return
     api = Api()
     httpd, port = start_server(api)
+    _log(f"[http] 监听 http://127.0.0.1:{port}/")
+    sw, sh = _screen_size()
+    w, h = min(1380, max(1000, sw - 40)), min(880, max(680, sh - 40))
     window = webview.create_window(
-        "番茄小说下载器", url=f"http://127.0.0.1:{port}/", js_api=api,
-        width=1380, height=880, min_size=(1120, 720),
+        "番茄小说下载器", url=_ui_url(port),
+        width=w, height=h, min_size=(980, 640),
         background_color="#0A0B10", text_select=True,
     )
     api.window = window
     try:
         webview.start(debug=False)
     finally:
+        _log("======== 退出界面 ========")
         httpd.shutdown()
 
 
