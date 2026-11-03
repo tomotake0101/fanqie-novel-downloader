@@ -1214,6 +1214,21 @@ def _fix_covers(items):
     return items
 
 
+def default_out_dir():
+    """默认保存目录：优先用户下载文件夹，不可写就退回项目内 下载/。"""
+    candidates = [Path.home() / "Downloads" / "番茄小说", OUT_DIR]
+    for d in candidates:
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+            probe = d / ".write_test"
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink()
+            return str(d)
+        except Exception:
+            continue
+    return str(OUT_DIR)
+
+
 class Api:
     """暴露给前端的接口（js_api）"""
 
@@ -1260,7 +1275,7 @@ class Api:
             cats = {}
         n = index_count()
         print(f"[meta] index_count={n} 分类组={list(cats.keys())}", flush=True)
-        return {"index_count": n, "categories": cats}
+        return {"index_count": n, "categories": cats, "out_dir": default_out_dir()}
 
     # ---------- 详情 / 章节 ----------
     def detail(self, book_id):
@@ -1296,7 +1311,15 @@ class Api:
             chapters = [c for c in chapters if c["id"] in wanted]
         if not chapters:
             return {"error": "没有可下载的章节"}
-        out_dir = out_dir or str(Path.home() / "Downloads" / "番茄小说")
+        out_dir = (out_dir or "").strip() or default_out_dir()
+        # 防御：前端可能传来无效/无权限的路径（例如 C:\Users\Downloads）
+        try:
+            Path(out_dir).mkdir(parents=True, exist_ok=True)
+            probe = Path(out_dir) / ".write_test"
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink()
+        except Exception:
+            out_dir = default_out_dir()
         _stop_flag.clear()
         _dl_running.set()
 
@@ -1414,7 +1437,10 @@ class _Handler(BaseHTTPRequestHandler):
 def start_server(api):
     _Handler.api = api
     _Handler.ui_file = APP_DIR / "ui" / "index.html"
-    httpd = ThreadingHTTPServer(("127.0.0.1", 8731), _Handler)
+    try:
+        httpd = ThreadingHTTPServer(("127.0.0.1", 8731), _Handler)
+    except OSError:
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)  # 端口被占就随机
     port = httpd.server_address[1]
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     return httpd, port

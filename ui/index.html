@@ -431,7 +431,7 @@ window.addEventListener("unhandledrejection", function(e) {
     </div>
 
     <div class="footer">
-      <div class="path" id="outPath" title="点击选择目录">C:\\Users\\Downloads\\番茄小说</div>
+      <div class="path" id="outPath" title="点击选择目录">加载中…</div>
       <div class="th">线程 <input id="threads" value="8"></div>
       <div class="progress"><i id="prog"></i></div>
       <span class="status" id="status">就绪</span>
@@ -872,6 +872,7 @@ async function boot() {
   // 分类 / 标签 / 索引数量
   const meta = await api("meta", );
   $("#idxCount").textContent = meta.index_count;
+  if (meta.out_dir) { $("#outPath").textContent = meta.out_dir; }
   const cats = meta.categories || {};
   const cat = $("#selCat"), tag = $("#selTag");
   (cats["主分类"] || []).forEach((c) => cat.add(new Option(c.name, c.category_id)));
