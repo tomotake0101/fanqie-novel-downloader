@@ -941,8 +941,6 @@ def detail_cached(book_id):
 READERS_FILE = CACHE_DIR / "readers.json"
 _readers_cache = {}
 _readers_lock = threading.Lock()
-_readers_pending = set()
-_readers_block_until = 0.0
 _readers_loaded = False
 _readers_dirty = 0
 
@@ -1008,75 +1006,18 @@ def _remember_reader(book_id, n):
             _readers_save()
 
 
-def book_readers(book_id):
-    """在读人数：本地缓存 → 抓一次书籍页。"""
-    global _readers_block_until, _readers_dirty
+def readers_of(book_id):
+    """已经知道的在读人数（只查本地缓存，不联网）。
+
+    在读人数只在用户点开某本书时顺带抓——书籍页本来就为目录/正文抓了，
+    多抓一次就是纯浪费，还会被番茄当成爬虫限流。
+    """
     bid = str(book_id or "")
     if not bid:
         return 0
     with _readers_lock:
         _readers_load()
-        hit = _readers_cache.get(bid)
-    if hit:
-        return hit
-    if time.time() < _readers_block_until:
-        return 0
-    info = _book_cache.get(bid) or {}
-    n = int(info.get("readers") or 0)
-    if not n:
-        try:
-            txt = Http.get(PAGE_URL.format(book_id=bid))
-        except Exception:
-            return 0
-        if not (txt or "").strip():
-            _readers_block_until = time.time() + 900
-            _log("[readers] 书籍页返回空，判定被限流，在读数据暂停 15 分钟")
-            return 0
-        pg = extract_state(txt).get("page") or {}
-        n = int(pg.get("readCount") or 0)
-    if n:
-        with _readers_lock:
-            _readers_cache[bid] = n
-            _readers_dirty += 1
-            _readers_save()
-    return n
-
-
-def fill_readers(ids, workers=1, limit=6):
-    """后台慢慢补在读书数：一次最多 6 本、单线程、每次隔 1.2 秒。
-
-    番茄的书籍页对短时间内的密集请求很敏感（返回空页面），而详情/目录/下载
-    全靠同一个 /page/ 接口，所以这里宁可慢，也不能把主功能拖死。
-    """
-    if time.time() < _readers_block_until:
-        return 0
-    todo = []
-    with _readers_lock:
-        _readers_load()
-        for bid in ids or []:
-            bid = str(bid or "")
-            if len(todo) >= limit:
-                break
-            if bid and bid not in _readers_cache and bid not in _readers_pending:
-                _readers_pending.add(bid)
-                todo.append(bid)
-    if not todo:
-        return 0
-
-    def one(bid):
-        try:
-            book_readers(bid)
-            time.sleep(1.2)
-        finally:
-            with _readers_lock:
-                _readers_pending.discard(bid)
-
-    def run():
-        with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
-            list(pool.map(one, todo))
-
-    threading.Thread(target=run, daemon=True).start()
-    return len(todo)
+        return _readers_cache.get(bid) or 0
 
 
 def _attach_readers(items):
@@ -1570,22 +1511,6 @@ class Api:
                     "retry": True}
         except Exception:
             return {"error": "这本书打不开（可能已下架或仅 App 可读）"}
-
-    def readers_batch(self, ids):
-        """批量查在读人数：查到的立刻返回，没查过的丢后台慢慢补。"""
-        out, todo = {}, []
-        for bid in (ids or [])[:60]:
-            bid = str(bid or "")
-            if not bid:
-                continue
-            with _readers_lock:
-                n = _readers_cache.get(bid) or 0
-            if n:
-                out[bid] = n
-            else:
-                todo.append(bid)
-        pending = fill_readers(todo) if todo else 0
-        return {"readers": out, "pending": pending}
 
     def chapter(self, item_id):
         try:

@@ -549,44 +549,19 @@ function renderList(items, { keepSelection = false } = {}) {
   box.querySelectorAll(".card").forEach((el) => {
     el.addEventListener("click", () => selectBook(el.dataset.id));
   });
-  scheduleReaders();
 }
 
-/* ---------------- 在读人数（后台慢慢补，不挡界面） ---------------- */
-let _readerTimers = [];
-
-function scheduleReaders() {
-  _readerTimers.forEach(clearTimeout);
-  _readerTimers = [];
-  let round = 0;
-  const ask = async () => {
-    const ids = state.items.filter((b) => !b.readers).map((b) => b.book_id).slice(0, 6);
-    if (!ids.length || round >= 3) return;
-    round++;
-    try {
-      const r = await api("readers_batch", ids);
-      if (r && r.readers) patchReaders(r.readers);
-      if (r && r.pending) _readerTimers.push(setTimeout(ask, 4000));
-    } catch (e) {}
-  };
-  [1500, 4000].forEach((ms) => _readerTimers.push(setTimeout(ask, ms)));
-}
-
-function patchReaders(map) {
-  let detailHit = 0;
-  Object.keys(map).forEach((id) => {
-    const n = map[id];
-    if (!n) return;
-    const item = state.items.find((b) => b.book_id === id);
-    if (item && !item.readers) item.readers = n;
-    if (state.book && state.book.book_id === id) {
-      if (!state.book.readers) state.book.readers = n;
-      detailHit = n;
-    }
-    const card = document.querySelector(`.card[data-id="${id}"]`);
-    if (!card) return;
-    const meta = card.querySelector(".meta");
-    if (!meta) return;
+/* ---------------- 在读人数 ----------------
+   只在用户点开某本书时抓（详情接口本来就要抓那一页，顺带就有），
+   列表不做任何后台批量请求——番茄对密集抓书籍页很敏感，会把整个站点限流。 */
+function patchReader(id, n) {
+  if (!n) return;
+  const item = state.items.find((b) => b.book_id === id);
+  if (item) item.readers = n;
+  if (state.book && state.book.book_id === id) state.book.readers = n;
+  const card = document.querySelector(`.card[data-id="${id}"]`);
+  const meta = card && card.querySelector(".meta");
+  if (meta) {
     let el = meta.querySelector(".readers");
     if (!el) {
       el = document.createElement("span");
@@ -594,15 +569,13 @@ function patchReaders(map) {
       meta.appendChild(el);
     }
     el.textContent = `在读 ${fmtReaders(n)}`;
-  });
-  if (detailHit) {
-    const sub = $("#dSub");
-    if (sub && !sub.querySelector(".readers")) {
-      const el = document.createElement("span");
-      el.className = "readers";
-      el.textContent = `在读 ${fmtReaders(detailHit)}`;
-      sub.insertBefore(el, sub.children[1] || null);
-    }
+  }
+  const sub = $("#dSub");
+  if (state.book && state.book.book_id === id && sub && !sub.querySelector(".readers")) {
+    const el = document.createElement("span");
+    el.className = "readers";
+    el.textContent = `在读 ${fmtReaders(n)}`;
+    sub.insertBefore(el, sub.children[1] || null);
   }
 }
 
@@ -777,6 +750,7 @@ async function selectBook(id) {
   state.chapters = r.chapters || [];   // 先放好目录，再刷新详情，避免闪一下"没有目录"
   openDetail(state.book);
   renderCatalog();
+  if (state.book.readers) patchReader(id, state.book.readers);   // 在读人数随详情一起到的
   setStatus(`${state.book.name} · ${state.chapters.length} 章`);
 }
 
