@@ -933,6 +933,163 @@ def detail_cached(book_id):
     return info
 
 
+# ------------------------------------------------------------ 在读人数
+# 番茄书籍页的 __INITIAL_STATE__.page.readCount 就是「xx 万人在读」，
+# 跟书库接口里的 read_count 是同一个数（已验证：2548599 ↔ 254.9万人在读）。
+# 注意：批量抓书籍页很容易被风控限流（返回空页面），所以这里只少量、慢速补，
+# 而且一发现空响应就整体停 10 分钟，不能为了显示一个数字把主功能搞挂。
+READERS_FILE = CACHE_DIR / "readers.json"
+_readers_cache = {}
+_readers_lock = threading.Lock()
+_readers_pending = set()
+_readers_block_until = 0.0
+_readers_loaded = False
+_readers_dirty = 0
+
+
+def _readers_load():
+    global _readers_loaded
+    if _readers_loaded:
+        return
+    _readers_loaded = True
+    try:
+        if READERS_FILE.exists():
+            data = json.loads(READERS_FILE.read_text(encoding="utf-8"))
+            for k, v in (data or {}).items():
+                try:
+                    _readers_cache[str(k)] = int(v)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+def _readers_save():
+    global _readers_dirty
+    if _readers_dirty < 8:
+        return
+    _readers_dirty = 0
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        READERS_FILE.write_text(json.dumps(_readers_cache, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def readers_label(n):
+    """2548599 -> '254.9万'，1940 -> '1940'，没有就是空串。"""
+    try:
+        n = int(n or 0)
+    except Exception:
+        return ""
+    if n <= 0:
+        return ""
+    if n >= 10000:
+        v = n / 10000.0
+        return f"{v:.1f}万" if v < 100 else f"{v:.0f}万"
+    return str(n)
+
+
+def _remember_reader(book_id, n):
+    """记下一个在读人数（顺手落盘，下次开程序不用再抓）。"""
+    global _readers_dirty
+    try:
+        n = int(n or 0)
+    except Exception:
+        return
+    bid = str(book_id or "")
+    if not bid or n <= 0:
+        return
+    with _readers_lock:
+        _readers_load()
+        if _readers_cache.get(bid) != n:
+            _readers_cache[bid] = n
+            _readers_dirty += 1
+            _readers_save()
+
+
+def book_readers(book_id):
+    """在读人数：本地缓存 → 抓一次书籍页。"""
+    global _readers_block_until, _readers_dirty
+    bid = str(book_id or "")
+    if not bid:
+        return 0
+    with _readers_lock:
+        _readers_load()
+        hit = _readers_cache.get(bid)
+    if hit:
+        return hit
+    if time.time() < _readers_block_until:
+        return 0
+    info = _book_cache.get(bid) or {}
+    n = int(info.get("readers") or 0)
+    if not n:
+        try:
+            txt = Http.get(PAGE_URL.format(book_id=bid))
+        except Exception:
+            return 0
+        if not (txt or "").strip():
+            _readers_block_until = time.time() + 900
+            _log("[readers] 书籍页返回空，判定被限流，在读数据暂停 15 分钟")
+            return 0
+        pg = extract_state(txt).get("page") or {}
+        n = int(pg.get("readCount") or 0)
+    if n:
+        with _readers_lock:
+            _readers_cache[bid] = n
+            _readers_dirty += 1
+            _readers_save()
+    return n
+
+
+def fill_readers(ids, workers=1, limit=6):
+    """后台慢慢补在读书数：一次最多 6 本、单线程、每次隔 1.2 秒。
+
+    番茄的书籍页对短时间内的密集请求很敏感（返回空页面），而详情/目录/下载
+    全靠同一个 /page/ 接口，所以这里宁可慢，也不能把主功能拖死。
+    """
+    if time.time() < _readers_block_until:
+        return 0
+    todo = []
+    with _readers_lock:
+        _readers_load()
+        for bid in ids or []:
+            bid = str(bid or "")
+            if len(todo) >= limit:
+                break
+            if bid and bid not in _readers_cache and bid not in _readers_pending:
+                _readers_pending.add(bid)
+                todo.append(bid)
+    if not todo:
+        return 0
+
+    def one(bid):
+        try:
+            book_readers(bid)
+            time.sleep(1.2)
+        finally:
+            with _readers_lock:
+                _readers_pending.discard(bid)
+
+    def run():
+        with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+            list(pool.map(one, todo))
+
+    threading.Thread(target=run, daemon=True).start()
+    return len(todo)
+
+
+def _attach_readers(items):
+    """把已知的在读人数贴到结果上（不知道的留给前端异步补）。"""
+    with _readers_lock:
+        _readers_load()
+        for b in items or []:
+            n = _readers_cache.get(str(b.get("book_id") or ""))
+            if n:
+                b["readers"] = n
+    return items
+
+
 def hydrate_books(ids, workers=8):
     """并发把 book_id 换成明文书籍信息（书库接口给的书名是混淆的）。"""
     out, lock = [], threading.Lock()
@@ -996,8 +1153,69 @@ def reader_to_book(chapter_id):
     return m.group(1) if m else None
 
 
+class RateLimited(RuntimeError):
+    """番茄风控：接口返回 200 但内容为空，隔一会儿才恢复。"""
+
+
+def get_page(url, retries=3):
+    """抓页面；空响应说明被风控限流了，单独报出来，别当成"这本书不存在"。"""
+    txt = Http.get(url, retries=retries)
+    if not (txt or "").strip():
+        raise RateLimited("番茄返回了空页面")
+    return txt
+
+
+def _fallback_detail(book_id, with_chapters=True):
+    """书籍页被限流时的兜底：目录接口 + 已知/搜到的书籍信息 + 第一章阅读页。"""
+    meta = dict(_book_cache.get(book_id) or {})
+    if not meta.get("name"):
+        meta.update(_seen_books.get(book_id) or {})
+    volumes = []
+    try:
+        data = http_json(DIRECTORY_API.format(book_id=book_id)).get("data") or {}
+        for vol in (data.get("chapterListWithVolume") or []):
+            volumes.append([{"id": c["itemId"], "title": c.get("title", ""),
+                             "pay": int(c.get("needPay") or 0)} for c in vol])
+    except Exception:
+        volumes = []
+    if not volumes:
+        raise RateLimited("书籍页和目录都拿不到")
+    first_id = volumes[0][0]["id"] if volumes and volumes[0] else ""
+    if first_id and not (meta.get("name") and meta.get("author")):
+        try:
+            cd = ((extract_state(get_page(READER_URL.format(item_id=first_id))).get("reader") or {})
+                  .get("chapterData")) or {}
+            meta.setdefault("name", cd.get("bookName") or "")
+            meta.setdefault("author", cd.get("author") or "")
+            meta.setdefault("cover", cd.get("thumbUri") or "")
+        except Exception:
+            pass
+    info = {
+        "book_id": book_id,
+        "name": meta.get("name") or f"书籍 {book_id}",
+        "author": meta.get("author") or "",
+        "status": ("完结" if str(meta.get("creation_status") or "") == "0"
+                   else (meta.get("status") or "连载中")),
+        "words": int(meta.get("words") or 0),
+        "readers": int(meta.get("readers") or 0),
+        "abstract": meta.get("abstract") or "",
+        "cover": meta.get("cover") or "",
+        "last": "",
+        "total": 0,
+        "volumes": [{"name": f"第{i + 1}卷", "chapters": v} for i, v in enumerate(volumes)],
+    }
+    info["total"] = sum(len(v["chapters"]) for v in info["volumes"])
+    _log(f"[fallback] 书籍页不可用，用目录接口拿到了 {book_id} 的 {info['total']} 章")
+    return info
+
+
 def book_detail(book_id, with_chapters=True):
-    page_html = Http.get(PAGE_URL.format(book_id=book_id))
+    try:
+        page_html = get_page(PAGE_URL.format(book_id=book_id))
+    except RateLimited:
+        if with_chapters:
+            return _fallback_detail(book_id, True)
+        raise
     state = extract_state(page_html)
     pg = state.get("page") or {}
     if not pg.get("bookName"):
@@ -1008,6 +1226,7 @@ def book_detail(book_id, with_chapters=True):
         "author": pg.get("author") or pg.get("authorName") or "",
         "status": "完结" if str(pg.get("creationStatus")) == "0" else "连载中",
         "words": int(pg.get("wordNumber") or 0),
+        "readers": int(pg.get("readCount") or 0),   # 「xx 万人在读」
         "abstract": (pg.get("abstract") or "").strip(),
         "cover": pg.get("thumbUri") or "",
         "last": pg.get("lastChapterTitle") or "",
@@ -1041,7 +1260,7 @@ def chapter_text(item_id):
     """取一章正文，返回 {'title','text','words','pay'}。"""
     if not item_id:
         raise RuntimeError("空章节号")
-    page = Http.get(READER_URL.format(item_id=item_id))
+    page = get_page(READER_URL.format(item_id=item_id))
     state = extract_state(page)
     data = ((state.get("reader") or {}).get("chapterData")) or {}
     if not data:
@@ -1145,7 +1364,12 @@ def download_book(book, chapters, out_dir, threads=8, on_log=None, on_progress=N
     stopped = bool(should_stop and should_stop())
 
     # 合成 txt
-    lines = [book["name"], f"作者：{book['author']}", f"字数：{book['words']}", ""]
+    lines = [book["name"], f"作者：{book['author']}"]
+    if book.get("words"):
+        lines.append(f"字数：{book['words']}")
+    if book.get("readers"):
+        lines.append(f"在读：{readers_label(book['readers'])}")
+    lines.append("")
     if book.get("abstract"):
         lines += ["【简介】", book["abstract"], ""]
     if stopped:
@@ -1206,6 +1430,27 @@ import webview  # noqa: E402
 _stop_flag = threading.Event()
 _book_cache = {}
 _dl_running = threading.Event()
+_seen_books = {}      # 搜索/书库见过的书（书籍页被限流时靠它兜底）
+_seen_lock = threading.Lock()
+
+
+def _remember_books(items):
+    """把搜索结果里的书籍信息记一份，书籍页抓不到时能顶上。"""
+    with _seen_lock:
+        for b in items or []:
+            bid = str(b.get("book_id") or "")
+            if not bid or not b.get("name"):
+                continue
+            _seen_books[bid] = {
+                "name": b.get("name"), "author": b.get("author"),
+                "abstract": b.get("abstract"), "words": b.get("words") or 0,
+                "cover": b.get("cover"), "readers": b.get("readers") or 0,
+                "cat": b.get("category") or "", "status": b.get("status") or "",
+            }
+        if len(_seen_books) > 8000:
+            for k in list(_seen_books)[:2000]:
+                _seen_books.pop(k, None)
+    return items
 
 
 def _chapters_flat(info):
@@ -1269,9 +1514,11 @@ class Api:
             meta = {}
             if mode == "ai":
                 items, note = ai_search(kw, limit=40, log=lambda s: print(s))
-                return {"items": _fix_covers(items), "has_more": False, "next_offset": 0, "note": note}
+                return {"items": _remember_books(_attach_readers(_fix_covers(items))),
+                        "has_more": False, "next_offset": 0, "note": note}
             items = search_books(kw, mode=mode, limit=60, meta=meta, log=lambda s: print(s))
-            return {"items": _fix_covers(items), "has_more": bool(meta.get("has_more")),
+            return {"items": _remember_books(_attach_readers(_fix_covers(items))),
+                    "has_more": bool(meta.get("has_more")),
                     "next_offset": meta.get("next_offset", len(items))}
         except Exception as e:
             return {"error": str(e)}
@@ -1280,7 +1527,8 @@ class Api:
         try:
             meta = {}
             items = search_books(kw, mode=mode, limit=30, offset=int(offset or 0), meta=meta)
-            return {"items": _fix_covers(items), "has_more": bool(meta.get("has_more")),
+            return {"items": _remember_books(_attach_readers(_fix_covers(items))),
+                    "has_more": bool(meta.get("has_more")),
                     "next_offset": meta.get("next_offset", 0)}
         except Exception as e:
             return {"error": str(e)}
@@ -1289,7 +1537,7 @@ class Api:
     def library(self, filters, page=0):
         try:
             rows, total = library_list(page_index=int(page or 0), **(filters or {}))
-            items = hydrate_books([r["book_id"] for r in rows])
+            items = _attach_readers(hydrate_books([r["book_id"] for r in rows]))
             return {"items": _fix_covers(items), "total": total,
                     "page_total": max(1, min(556, (total + 17) // 18))}
         except Exception as e:
@@ -1311,17 +1559,40 @@ class Api:
         try:
             info = book_detail(book_id, with_chapters=True)
             _book_cache[book_id] = info
+            if info.get("readers"):
+                _remember_reader(book_id, info["readers"])
             book = {k: info[k] for k in ("book_id", "name", "author", "status",
-                                         "words", "abstract", "cover") if k in info}
+                                         "words", "abstract", "cover", "readers") if k in info}
             book["cover"] = _fix_cover(book.get("cover"))
             return {"book": book, "chapters": _chapters_flat(info)}
+        except RateLimited:
+            return {"error": "番茄暂时限制了这台机器的请求（返回空页面），过几分钟再点这本书；搜索不受影响",
+                    "retry": True}
         except Exception:
             return {"error": "这本书打不开（可能已下架或仅 App 可读）"}
+
+    def readers_batch(self, ids):
+        """批量查在读人数：查到的立刻返回，没查过的丢后台慢慢补。"""
+        out, todo = {}, []
+        for bid in (ids or [])[:60]:
+            bid = str(bid or "")
+            if not bid:
+                continue
+            with _readers_lock:
+                n = _readers_cache.get(bid) or 0
+            if n:
+                out[bid] = n
+            else:
+                todo.append(bid)
+        pending = fill_readers(todo) if todo else 0
+        return {"readers": out, "pending": pending}
 
     def chapter(self, item_id):
         try:
             info = chapter_text(item_id)
             return {"title": info["title"], "text": info["text"], "words": info["words"]}
+        except RateLimited:
+            return {"error": "番茄暂时限制了请求，过几分钟再试", "retry": True}
         except Exception as e:
             return {"error": f"正文取不到：{e}"}
 

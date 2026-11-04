@@ -192,6 +192,7 @@ select:focus{border-color:var(--accent)}
   color:var(--accent);background:var(--accent-soft);
 }
 .why{font-size:10.5px;color:var(--accent);opacity:.9}
+.readers{font-size:10.5px;color:var(--text-2);font-variant-numeric:tabular-nums}
 
 .empty{
   height:100%;display:grid;place-content:center;justify-items:center;gap:10px;
@@ -493,6 +494,13 @@ function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 function fmtWords(n) { return n ? (n / 10000).toFixed(1) + " 万字" : ""; }
+function fmtReaders(n) {
+  n = Number(n) || 0;
+  if (n <= 0) return "";
+  if (n >= 100000000) return (n / 100000000).toFixed(1) + "亿";
+  if (n >= 10000) return (n / 10000).toFixed(1) + "万";
+  return String(n);
+}
 function waitApi() { return Promise.resolve(); }
 
 /* ---------------- 列表 ---------------- */
@@ -521,6 +529,7 @@ function renderList(items, { keepSelection = false } = {}) {
       : b.status === "连载中" ? `<span class="badge ongoing">连载</span>` : "";
     const cat = b.category ? `<span class="chip">${esc(b.category)}</span>` : "";
     const why = b.why ? `<span class="why">${esc(b.why)}</span>` : "";
+    const rd = b.readers ? `<span class="readers">在读 ${fmtReaders(b.readers)}</span>` : "";
     const cover = b.cover
       ? `<img src="${esc(b.cover)}" loading="lazy" decoding="async" onerror="this.style.display='none'">`
       : esc((b.name || "?")[0]);
@@ -531,7 +540,7 @@ function renderList(items, { keepSelection = false } = {}) {
         <div class="body">
           <div class="title">${esc(b.name || "未知书名")}</div>
           <div class="meta">${esc(b.author || "未知作者")}${b.words ? " · " + fmtWords(b.words) : ""}
-            ${status}${cat}${why}</div>
+            ${rd}${status}${cat}${why}</div>
           ${b.abstract ? `<div class="abs">${esc(b.abstract)}</div>` : ""}
         </div>
       </div>`;
@@ -540,6 +549,61 @@ function renderList(items, { keepSelection = false } = {}) {
   box.querySelectorAll(".card").forEach((el) => {
     el.addEventListener("click", () => selectBook(el.dataset.id));
   });
+  scheduleReaders();
+}
+
+/* ---------------- 在读人数（后台慢慢补，不挡界面） ---------------- */
+let _readerTimers = [];
+
+function scheduleReaders() {
+  _readerTimers.forEach(clearTimeout);
+  _readerTimers = [];
+  let round = 0;
+  const ask = async () => {
+    const ids = state.items.filter((b) => !b.readers).map((b) => b.book_id).slice(0, 6);
+    if (!ids.length || round >= 3) return;
+    round++;
+    try {
+      const r = await api("readers_batch", ids);
+      if (r && r.readers) patchReaders(r.readers);
+      if (r && r.pending) _readerTimers.push(setTimeout(ask, 4000));
+    } catch (e) {}
+  };
+  [1500, 4000].forEach((ms) => _readerTimers.push(setTimeout(ask, ms)));
+}
+
+function patchReaders(map) {
+  let detailHit = 0;
+  Object.keys(map).forEach((id) => {
+    const n = map[id];
+    if (!n) return;
+    const item = state.items.find((b) => b.book_id === id);
+    if (item && !item.readers) item.readers = n;
+    if (state.book && state.book.book_id === id) {
+      if (!state.book.readers) state.book.readers = n;
+      detailHit = n;
+    }
+    const card = document.querySelector(`.card[data-id="${id}"]`);
+    if (!card) return;
+    const meta = card.querySelector(".meta");
+    if (!meta) return;
+    let el = meta.querySelector(".readers");
+    if (!el) {
+      el = document.createElement("span");
+      el.className = "readers";
+      meta.appendChild(el);
+    }
+    el.textContent = `在读 ${fmtReaders(n)}`;
+  });
+  if (detailHit) {
+    const sub = $("#dSub");
+    if (sub && !sub.querySelector(".readers")) {
+      const el = document.createElement("span");
+      el.className = "readers";
+      el.textContent = `在读 ${fmtReaders(detailHit)}`;
+      sub.insertBefore(el, sub.children[1] || null);
+    }
+  }
 }
 
 function markSelected() {
@@ -553,16 +617,18 @@ function openDetail(book) {
   $("#detail").classList.add("open");
   $("#content").classList.add("with-detail");
   $("#dTitle").textContent = book.name || "未知书名";
-  const parts = [
-    book.author || "未知作者",
-    fmtWords(book.words),
-    book.status,
-    book.category,
-  ].filter(Boolean);
-  $("#dSub").innerHTML = parts.map((p, i) =>
-    i === 2 ? (book.status === "完结" ? `<span class="badge done">${esc(p)}</span>` : `<span class="badge ongoing">${esc(p)}</span>`)
-      : i === 3 ? `<span class="chip">${esc(p)}</span>` : esc(p)
-  ).join(" · ");
+  const bits = [esc(book.author || "未知作者")];
+  if (book.words) bits.push(fmtWords(book.words));
+  if (book.readers) bits.push(`<span class="readers">在读 ${fmtReaders(book.readers)}</span>`);
+  if (book.status) {
+    bits.push(book.status === "完结"
+      ? `<span class="badge done">完结</span>`
+      : `<span class="badge ongoing">${esc(book.status)}</span>`);
+  } else if (book.category) {
+    bits.push(`<span class="chip">${esc(book.category)}</span>`);
+  }
+  if (book.status && book.category) bits.push(`<span class="chip">${esc(book.category)}</span>`);
+  $("#dSub").innerHTML = bits.join(" · ");
   $("#dAbs").textContent = book.abstract || "";
   const cover = $("#dCover");
   cover.innerHTML = book.cover
@@ -697,6 +763,8 @@ async function selectBook(id) {
   if (r.error) {
     toast(r.error);
     $("#dPane").innerHTML = `<div class="empty" style="padding:30px 0;height:auto">${esc(r.error)}</div>`;
+    // 被限流就别跳了，所有书都会一样失败
+    if (r.retry) return;
     // 自动跳过打不开的书
     const idx = state.items.findIndex((b) => b.book_id === id);
     if (idx >= 0 && idx + 1 < state.items.length && (state._skip = (state._skip || 0) + 1) <= 3) {
