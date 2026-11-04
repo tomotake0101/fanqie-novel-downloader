@@ -703,18 +703,48 @@ def search_books(keyword, mode="book", limit=60, log=None, auto_index=True, offs
 
 # ------------------------------------------------------------- AI 找书
 AI_FILE = CACHE_DIR / "ai.json"
-AI_DEFAULTS = {"base_url": "https://api.deepseek.com", "model": "deepseek-chat", "api_key": ""}
+
+# 只要求「OpenAI 兼容」：都能直接 POST /chat/completions。
+# id -> (显示名, 默认接口地址, 默认模型)
+AI_PROVIDERS = {
+    "deepseek":    ("DeepSeek",              "https://api.deepseek.com",             "deepseek-chat"),
+    "openrouter":  ("OpenRouter",            "https://openrouter.ai/api/v1",         "deepseek/deepseek-chat"),
+    "siliconflow": ("硅基流动",              "https://api.siliconflow.cn/v1",        "deepseek-ai/DeepSeek-V3"),
+    "zhipu":       ("智谱 GLM",              "https://open.bigmodel.cn/api/paas/v4", "glm-4-flash"),
+    "moonshot":    ("Moonshot Kimi",         "https://api.moonshot.cn/v1",           "moonshot-v1-8k"),
+    "openai":      ("OpenAI",                "https://api.openai.com/v1",            "gpt-4o-mini"),
+    "ollama":      ("本地 Ollama（不用 Key）", "http://127.0.0.1:11434/v1",          "qwen2.5:7b"),
+    "custom":      ("自定义（OpenAI 兼容）",  "",                                     ""),
+}
+
+AI_DEFAULTS = {"provider": "deepseek", "base_url": "https://api.deepseek.com",
+               "model": "deepseek-chat", "api_key": ""}
+
+
+def ai_provider_label(cfg):
+    return (AI_PROVIDERS.get((cfg or {}).get("provider") or "") or ("AI 接口",))[0]
+
+
+def _is_local_url(url):
+    return bool(re.search(r"//(127\.0\.0\.1|localhost|0\.0\.0\.0|\[::1\])", str(url or "")))
 
 
 def ai_config():
     cfg = dict(AI_DEFAULTS)
     try:
         if AI_FILE.exists():
-            cfg.update(json.loads(AI_FILE.read_text(encoding="utf-8")))
+            cfg.update(json.loads(AI_FILE.read_text(encoding="utf-8")) or {})
     except Exception:
         pass
-    if os.environ.get("DEEPSEEK_API_KEY"):
-        cfg["api_key"] = os.environ["DEEPSEEK_API_KEY"]
+    preset = AI_PROVIDERS.get(cfg.get("provider") or "")
+    if preset:
+        cfg["base_url"] = (cfg.get("base_url") or "").strip() or preset[1]
+        cfg["model"] = (cfg.get("model") or "").strip() or preset[2]
+    for env in ("AI_API_KEY", "DEEPSEEK_API_KEY", "OPENROUTER_API_KEY"):
+        v = os.environ.get(env)
+        if v and not (cfg.get("api_key") or "").strip():
+            cfg["api_key"] = v
+            break
     return cfg
 
 
@@ -728,33 +758,78 @@ def ai_save_config(cfg):
 
 
 def ai_ready():
-    return bool((ai_config().get("api_key") or "").strip())
+    cfg = ai_config()
+    return bool((cfg.get("api_key") or "").strip()) or _is_local_url(cfg.get("base_url"))
 
 
 def ai_chat(messages, temperature=0.3, json_mode=False, timeout=90):
-    """调用 DeepSeek（OpenAI 兼容）接口。"""
+    """调用任意 OpenAI 兼容接口（DeepSeek / OpenRouter / 硅基流动 / 本地 Ollama 都行）。"""
     cfg = ai_config()
     key = (cfg.get("api_key") or "").strip()
-    if not key:
-        raise RuntimeError("还没配置 DeepSeek API Key，点右上角 ⚙ 填一下")
-    body = {"model": cfg.get("model") or "deepseek-chat", "messages": messages,
-            "temperature": temperature, "stream": False}
-    if json_mode:
-        body["response_format"] = {"type": "json_object"}
-    url = (cfg.get("base_url") or AI_DEFAULTS["base_url"]).rstrip("/") + "/chat/completions"
-    req = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"), headers={
-        "Content-Type": "application/json", "Authorization": "Bearer " + key})
-    try:
+    base = (cfg.get("base_url") or "").strip()
+    model = (cfg.get("model") or "").strip()
+    label = ai_provider_label(cfg)
+    if not base:
+        raise RuntimeError("还没填接口地址，点右上角 ⚙ 选个服务商或自己填")
+    if not model:
+        raise RuntimeError("还没填模型名，点右上角 ⚙ 配一下")
+    if not key and not _is_local_url(base):
+        raise RuntimeError("还没填 API Key，点右上角 ⚙ 配一下（本地 Ollama 不需要 Key）")
+    url = base.rstrip("/")
+    if not url.endswith("/chat/completions"):
+        url += "/chat/completions"
+
+    def once(with_json):
+        body = {"model": model, "messages": messages,
+                "temperature": temperature, "stream": False}
+        if with_json:
+            body["response_format"] = {"type": "json_object"}
+        headers = {"Content-Type": "application/json"}
+        if key:
+            headers["Authorization"] = "Bearer " + key
+        if "openrouter.ai" in url:     # OpenRouter 建议带上来源标识，不带也能用
+            headers["HTTP-Referer"] = "https://github.com/tomotake0101/fanqie-novel-downloader"
+            headers["X-Title"] = "fanqie-novel-downloader"
+        req = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"), headers=headers)
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            data = json.loads(r.read().decode("utf-8", "replace"))
+            return json.loads(r.read().decode("utf-8", "replace"))
+
+    try:
+        data = once(json_mode)
     except urllib.error.HTTPError as e:
-        detail = e.read().decode("utf-8", "replace")[:200]
-        if e.code == 401:
-            raise RuntimeError("DeepSeek API Key 无效，请重新填写")
-        raise RuntimeError(f"AI 接口返回 {e.code}：{detail}")
+        raw = e.read().decode("utf-8", "replace")[:220]
+        # 有些服务商/模型不认 response_format，去掉再试一次
+        if json_mode and e.code in (400, 404, 415, 422):
+            try:
+                data = once(False)
+            except urllib.error.HTTPError as e2:
+                raw2 = e2.read().decode("utf-8", "replace")[:220]
+                raise RuntimeError(f"{label} 返回 {e2.code}：{raw2}")
+            except Exception as e2:
+                raise RuntimeError(f"连不上 {label}（{url}）：{e2}")
+        elif e.code == 401:
+            raise RuntimeError(f"{label} 的 API Key 无效，重新填一下")
+        elif e.code in (402, 403):
+            raise RuntimeError(f"{label} 拒绝访问（{e.code}）：{raw}")
+        elif e.code == 429:
+            raise RuntimeError(f"{label} 限流或余额不足（429）：{raw}")
+        else:
+            raise RuntimeError(f"{label} 返回 {e.code}：{raw}")
     except Exception as e:
-        raise RuntimeError(f"AI 接口连接失败：{e}")
-    return (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
+        msg = str(e)
+        low = msg.lower()
+        if "10061" in msg or "connection refused" in low or "actively refused" in low:
+            msg = "连接被拒绝，这个地址上没有服务在监听（本地模型先启动 ollama serve）"
+        elif "timed out" in low or "timeout" in low:
+            msg = "请求超时，网络不通或服务太慢"
+        elif "name or service not known" in low or "getaddrinfo" in low:
+            msg = "域名解析失败，接口地址可能写错了"
+        raise RuntimeError(f"连不上 {label}（{url}）：{msg}")
+
+    choices = data.get("choices") or []
+    if not choices:
+        raise RuntimeError(f"{label} 没返回内容：{str(data)[:180]}")
+    return ((choices[0] or {}).get("message") or {}).get("content", "")
 
 
 def _json_of(text, fallback=None):
@@ -1584,14 +1659,31 @@ class Api:
 
     def get_ai_config(self):
         cfg = ai_config()
-        cfg = dict(cfg)
-        cfg["api_key"] = cfg.get("api_key") or ""
-        return cfg
+        out = {k: (cfg.get(k) or "") for k in ("provider", "base_url", "model", "api_key")}
+        out["providers"] = [{"id": k, "label": v[0], "base_url": v[1], "model": v[2]}
+                            for k, v in AI_PROVIDERS.items()]
+        out["ready"] = ai_ready()
+        return out
 
-    def save_ai_config(self, key, base_url, model):
-        ai_save_config({"api_key": key or "", "base_url": base_url or "https://api.deepseek.com",
-                        "model": model or "deepseek-chat"})
-        return {"ok": True}
+    def save_ai_config(self, key, base_url, model, provider=""):
+        cfg = ai_config()
+        cfg.update({
+            "api_key": (key or "").strip(),
+            "base_url": (base_url or "").strip(),
+            "model": (model or "").strip(),
+            "provider": (provider or cfg.get("provider") or "custom").strip(),
+        })
+        ai_save_config(cfg)
+        return {"ok": True, "ready": ai_ready()}
+
+    def ai_test(self):
+        """设置面板里的「测试」：真发一条请求，把服务商的原话带回来。"""
+        try:
+            reply = ai_chat([{"role": "user", "content": "只回复两个字：可以"}], timeout=45)
+            return {"ok": True, "reply": (reply or "").strip()[:60],
+                    "provider": ai_provider_label(ai_config())}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
 
     def build_index(self):
         def run():
